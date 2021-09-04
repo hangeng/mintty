@@ -1,5 +1,5 @@
 // termmouse.c (part of mintty)
-// Copyright 2008-12 Andy Koppe, 2017 Thomas Wolff
+// Copyright 2008-12 Andy Koppe, 2017-20 Thomas Wolff
 // Based on code from PuTTY-0.60 by Simon Tatham and team.
 // Licensed under the terms of the GNU General Public License v3 or later.
 
@@ -7,6 +7,7 @@
 #include "win.h"
 #include "child.h"
 #include "charset.h"  // cs__utftowcs
+#include "tek.h"
 
 /*
  * Fetch the character at a particular position in a line array.
@@ -299,25 +300,38 @@ send_mouse_event(mouse_action a, mouse_button b, mod_keys mods, pos p)
 
   uint x = p.x + 1, y = p.y + 1;
 
-  switch (b) {
-    when MBT_4:
-      b = MBT_LEFT; mods |= MDK_ALT;
-    when MBT_5:
-      b = MBT_RIGHT; mods |= MDK_ALT;
-    otherwise:;
+  if (a != MA_WHEEL) {
+    if (cfg.old_xbuttons)
+      switch (b) {
+        when MBT_4:
+          b = MBT_LEFT; mods |= MDK_ALT;
+        when MBT_5:
+          b = MBT_RIGHT; mods |= MDK_ALT;
+        otherwise:;
+      }
+    else
+      switch (b) {
+        when MBT_4:
+          b = 129;
+        when MBT_5:
+          b = 130;
+        otherwise:;
+      }
   }
 
   uint code = b ? b - 1 : 0x3;
 
   if (a != MA_RELEASE)
     code |= a * 0x20;
-  else if (term.mouse_enc != ME_XTERM_CSI)
+  else if (term.mouse_enc != ME_XTERM_CSI && term.mouse_enc != ME_PIXEL_CSI)
     code = 0x3;
 
   code |= (mods & ~cfg.click_target_mod) * 0x4;
 
   if (term.mouse_enc == ME_XTERM_CSI)
     child_printf("\e[<%u;%u;%u%c", code, x, y, (a == MA_RELEASE ? 'm' : 'M'));
+  else if (term.mouse_enc == ME_PIXEL_CSI)
+    child_printf("\e[<%u;%u;%u%c", code, p.pix + 1, p.piy + 1, (a == MA_RELEASE ? 'm' : 'M'));
   else if (term.mouse_enc == ME_URXVT_CSI)
     child_printf("\e[%u;%u;%uM", code + 0x20, x, y);
   else {
@@ -356,6 +370,7 @@ box_pos(pos p)
 {
   p.y = min(max(0, p.y), term.rows - 1);
   p.x = min(max(0, p.x), term.cols - 1);
+  // p.piy and p.pix already clipped in translate_pos()
   return p;
 }
 
@@ -418,19 +433,37 @@ check_app_mouse(mod_keys *mods_p)
   return cfg.clicks_target_app ^ override;
 }
 
-void
+bool
 term_mouse_click(mouse_button b, mod_keys mods, pos p, int count)
 {
+  compose_clear();
+
   if (term.hovering) {
     term.hovering = false;
     win_update(true);
   }
 
-  if (check_app_mouse(&mods)) {
+  bool res = true;
+  if (tek_mode == TEKMODE_GIN) {
+    char c = '`';
+    switch (b) {
+      when MBT_LEFT: c = 'l';
+      when MBT_MIDDLE: c = 'm';
+      when MBT_RIGHT: c = 'r';
+      when MBT_4: c = 'p';
+      when MBT_5: c = 'q';
+    }
+    if (mods & MDK_SHIFT)
+      c ^= ' ';
+    c |= 0x80;
+    child_send(&c, 1);
+    tek_send_address();
+  }
+  else if (check_app_mouse(&mods)) {
     if (term.mouse_mode == MM_X10)
       mods = 0;
     send_mouse_event(MA_CLICK, b, mods, box_pos(p));
-    term.mouse_state = b;
+    term.mouse_state = (int)b;
   }
   else {
     // generic transformation M4/M5 -> Alt+left/right;
@@ -456,22 +489,30 @@ term_mouse_click(mouse_button b, mod_keys mods, pos p, int count)
       // trying to ignore WM_CAPTURECHANGED does not help
       if (!alt || fake_alt)
         win_popup_menu(mods);
+      else
+        res = false;
     }
     else if (b == MBT_MIDDLE && (mods & ~MDK_SHIFT) == MDK_CTRL) {
       if (cfg.zoom_mouse)
         win_zoom_font(0, mods & MDK_SHIFT);
+      else
+        res = false;
     }
     else if ((b == MBT_RIGHT && rca == RC_PASTE) ||
-             (b == MBT_MIDDLE && mca == MC_PASTE)) {
+             (b == MBT_MIDDLE && mca == MC_PASTE))
+    {
       if (!alt)
         term.mouse_state = shift_or_ctrl ? MS_COPYING : MS_PASTING;
+      else
+        res = false;
     }
     else if ((b == MBT_RIGHT && rca == RC_ENTER) ||
              (b == MBT_MIDDLE && mca == MC_ENTER)) {
       child_send("\r", 1);
     }
-    else if (b == MBT_LEFT && mods == MDK_SHIFT && rca == RC_EXTEND)
+    else if (b == MBT_LEFT && mods == MDK_SHIFT && rca == RC_EXTEND) {
       term.mouse_state = MS_PASTING;
+    }
     else if (b == MBT_LEFT && (mods & ~cfg.click_target_mod) == MDK_CTRL) {
       if (count == cfg.opening_clicks) {
         // Open word under cursor
@@ -483,10 +524,13 @@ term_mouse_click(mouse_button b, mod_keys mods, pos p, int count)
         sel_spread();
         win_update(true);
       }
+      else
+        res = false;
     }
     else if (b == MBT_MIDDLE && mca == MC_VOID) {
+      // res = true; // MC_VOID explicitly ignores the click
     }
-    else {
+    else if ((mods & (MDK_CTRL | MDK_ALT)) != (MDK_CTRL | MDK_ALT)) {
       // Only clicks for selecting and extending should get here.
       p = get_selpoint(box_pos(p));
       term.mouse_state = -count;
@@ -507,19 +551,26 @@ term_mouse_click(mouse_button b, mod_keys mods, pos p, int count)
       win_capture_mouse();
       win_update(true);
     }
+    else {
+      res = false;
+    }
   }
+
+  return res;
 }
 
 void
 term_mouse_release(mouse_button b, mod_keys mods, pos p)
 {
+  compose_clear();
+
   int state = term.mouse_state;
   term.mouse_state = 0;
   switch (state) {
     when MS_COPYING: term_copy();
     when MS_PASTING: win_paste();
     when MS_OPENING: {
-      termline *line = fetch_line(p.y);
+      termline *line = fetch_line(p.y + term.disptop);
       int urli = line->chars[p.x].attr.link;
       release_line(line);
       char * url = geturl(urli);
@@ -614,6 +665,8 @@ sel_scroll_cb(void)
 void
 term_mouse_move(mod_keys mods, pos p)
 {
+  compose_clear();
+
   //printf("mouse_move %d+%d/2\n", p.x, p.r);
   pos bp = box_pos(p);
 
@@ -637,13 +690,17 @@ term_mouse_move(mod_keys mods, pos p)
     win_update(true);
   }
   else if (term.mouse_state == MS_OPENING) {
+    // let's not clear link opening state when just moving the mouse (#1039)
+    // but only after hovering out of the link area (below)
+#ifdef link_opening_only_if_unmoved
     term.mouse_state = 0;
     term.selected = false;
     win_update(true);
+#endif
   }
   else if (term.mouse_state > 0) {
     if (term.mouse_mode >= MM_BTN_EVENT)
-      send_mouse_event(MA_MOVE, term.mouse_state, mods, bp);
+      send_mouse_event(MA_MOVE, (mouse_button)term.mouse_state, mods, bp);
   }
   else {
     if (term.mouse_mode == MM_ANY_EVENT)
@@ -664,12 +721,18 @@ term_mouse_move(mod_keys mods, pos p)
       term.hovering = false;
       win_update(true);
     }
+    //printf("->hovering %d (opening %d)\n", term.hovering, term.mouse_state == MS_OPENING);
+    // clear link opening state after hovering out of link area
+    if (!term.hovering && term.mouse_state == MS_OPENING)
+      term.mouse_state = 0;
   }
 }
 
 void
-term_mouse_wheel(int delta, int lines_per_notch, mod_keys mods, pos p)
+term_mouse_wheel(bool horizontal, int delta, int lines_per_notch, mod_keys mods, pos p)
 {
+  compose_clear();
+
   if (term.hovering) {
     term.hovering = false;
     win_update(true);
@@ -677,10 +740,17 @@ term_mouse_wheel(int delta, int lines_per_notch, mod_keys mods, pos p)
 
   enum { NOTCH_DELTA = 120 };
 
-  static int accu;
+  static int accu = 0;
   accu += delta;
 
-  if (check_app_mouse(&mods)) {
+  if (tek_mode == TEKMODE_GIN) {
+    int step = (mods & MDK_SHIFT) ? 40 : (mods & MDK_CTRL) ? 1 : 4;
+    if (horizontal ^ (mods & MDK_CTRL))
+      tek_move_by(0, step * delta / NOTCH_DELTA);
+    else
+      tek_move_by(step * delta / NOTCH_DELTA, 0);
+  }
+  else if (check_app_mouse(&mods)) {
     if (strstr(cfg.suppress_wheel, "report"))
       return;
     // Send as mouse events, with one event per notch.
@@ -688,11 +758,17 @@ term_mouse_wheel(int delta, int lines_per_notch, mod_keys mods, pos p)
     if (notches) {
       accu -= NOTCH_DELTA * notches;
       mouse_button b = (notches < 0) + 1;
+      if (horizontal)
+        b = 5 - b;
       notches = abs(notches);
-      do send_mouse_event(MA_WHEEL, b, mods, p); while (--notches);
+      do
+        send_mouse_event(MA_WHEEL, b, mods, box_pos(p));
+      while (--notches);
     }
   }
-  else if ((mods & ~MDK_SHIFT) == MDK_CTRL) {
+  else if (horizontal) {
+  }
+  else if (cfg.zoom_mouse && (mods & ~MDK_SHIFT) == MDK_CTRL) {
     if (strstr(cfg.suppress_wheel, "zoom"))
       return;
     if (cfg.zoom_mouse) {
@@ -703,16 +779,22 @@ term_mouse_wheel(int delta, int lines_per_notch, mod_keys mods, pos p)
       }
     }
   }
-  else if (!(mods & ~MDK_SHIFT)) {
+  else if (!(mods & ~(MDK_SHIFT | MDK_CTRL | MDK_ALT))) {
+    if (mods & MDK_CTRL)
+      lines_per_notch = 1;
+    else if (cfg.lines_per_notch > 0)
+      lines_per_notch = min(cfg.lines_per_notch, term.rows - 1);
+
     // Scroll, taking the lines_per_notch setting into account.
     // Scroll by a page per notch if setting is -1 or Shift is pressed.
-    int lines_per_page = max(1, term.rows - 1);
+    int lines_per_page = max(1, term.rows);
     if (lines_per_notch == -1 || mods & MDK_SHIFT)
       lines_per_notch = lines_per_page;
     int lines = lines_per_notch * accu / NOTCH_DELTA;
+    //printf("mouse lines %d per notch %d accu %d\n", lines, lines_per_notch, accu);
     if (lines) {
       accu -= lines * NOTCH_DELTA / lines_per_notch;
-      if (!term.on_alt_screen || term.show_other_screen) {
+      if ((!term.on_alt_screen || term.show_other_screen) && !(mods & MDK_ALT)) {
         if (strstr(cfg.suppress_wheel, "scrollwin"))
           return;
         term_scroll(0, -lines);

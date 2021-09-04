@@ -7,13 +7,16 @@
 #include "winsearch.h"
 #include "charset.h"  // wcscpy, wcsncat, combiningdouble
 #include "config.h"
-#include "winimg.h"  // winimg_paint
+#include "winimg.h"  // winimgs_paint
+#include "tek.h"
 
 #include <winnls.h>
 #include <usp10.h>  // Uniscribe
 
 
 #define dont_debug_bold 1
+
+#define dont_narrow_via_font
 
 enum {
   FONT_NORMAL    = 0x00,
@@ -26,9 +29,16 @@ enum {
   FONT_HIGH      = 0x10,
   FONT_ZOOMFULL  = 0x20,
   FONT_ZOOMSMALL = 0x40,
-  FONT_WIDE      = 0x80,
-  FONT_NARROW    = 0x100,
+  FONT_ZOOMDOWN  = 0x80,
+  FONT_WIDE      = 0x100,
+#ifdef narrow_via_font
+#warning narrowing via font is deprecated
+  FONT_NARROW    = 0x200,
   FONT_MAXNO     = FONT_WIDE + FONT_NARROW
+#else
+  FONT_NARROW    = 0,	// disabled narrowing via font
+  FONT_MAXNO     = 2 * FONT_WIDE
+#endif
 };
 
 enum {LDRAW_CHAR_NUM = 31, LDRAW_CHAR_TRIES = 4};
@@ -91,6 +101,7 @@ static int font_height;
 int cell_width, cell_height;
 // border padding:
 int PADDING = 1;
+int OFFSET = 0;
 // width mode
 bool font_ambig_wide;
 
@@ -243,7 +254,7 @@ get_font_quality(void)
 
 #define dont_debug_fonts 1
 
-#define dont_debug_win_char_width
+#define dont_debug_win_char_width_init
 
 #if defined(debug_fonts) && debug_fonts > 0
 #define trace_font(params)	printf params
@@ -290,8 +301,10 @@ row_padding(int i, int e)
   }
 }
 
+static char * font_warnings = 0;
+
 static void
-show_font_warning(struct fontfam * ff, char * msg)
+font_warning(struct fontfam * ff, char * msg)
 {
   // suppress multiple font error messages
   if (ff->name_reported && wcscmp(ff->name_reported, ff->name) == 0) {
@@ -304,16 +317,26 @@ show_font_warning(struct fontfam * ff, char * msg)
   }
 
   char * fn = cs__wcstoutf(ff->name);
-  char * fullmsg;
-  int len = asprintf(&fullmsg, "%s:\n%s", msg, fn);
-  free(fn);
-  if (len > 0) {
-    show_message(fullmsg, MB_ICONWARNING);
-    free(fullmsg);
+  if (font_warnings) {
+    char * newfw = asform("%s\n%s:\n%s", font_warnings, msg, fn);
+    free(font_warnings);
+    font_warnings = newfw;
   }
   else
-    show_message(msg, MB_ICONWARNING);
+    font_warnings = asform("%s:\n%s", msg, fn);
+  free(fn);
 }
+
+static void
+show_font_warnings(void)
+{
+  if (font_warnings) {
+    show_message(font_warnings, MB_ICONWARNING);
+    free(font_warnings);
+    font_warnings = 0;
+  }
+}
+
 
 #ifndef TCI_SRCLOCALE
 //old MinGW
@@ -414,7 +437,7 @@ enum_fonts_adjust_font_weights(const LOGFONTW * lfp, const TEXTMETRICW * tmp, DW
 }
 
 static void
-adjust_font_weights(struct fontfam * ff)
+adjust_font_weights(struct fontfam * ff, int findex)
 {
   LOGFONTW lf;
   wcscpy(lf.lfFaceName, W(""));
@@ -440,6 +463,14 @@ adjust_font_weights(struct fontfam * ff)
     .cs_found = default_charset == DEFAULT_CHARSET
   };
 
+  // do not enumerate all fonts for unspecified alternative font
+  if (ff->name[0] == 0) {
+    ff->fw_norm = 400;
+    ff->fw_bold = 700;
+    trace_font(("--\n"));
+    return;
+  }
+
   HDC dc = GetDC(0);
   EnumFontFamiliesExW(dc, &lf, enum_fonts_adjust_font_weights, (LPARAM)&data, 0);
   trace_font(("font width (%d)%d(%d)/(%d)%d(%d)", data.fw_norm_0, ff->fw_norm, data.fw_norm_1, data.fw_bold_0, ff->fw_bold, data.fw_bold_1));
@@ -447,7 +478,7 @@ adjust_font_weights(struct fontfam * ff)
 
   // check if no font found
   if (!data.font_found) {
-    show_font_warning(ff, _("Font not found, using system substitute"));
+    font_warning(ff, _("Font not found, using system substitute"));
     ff->fw_norm = 400;
     ff->fw_bold = 700;
     trace_font(("//\n"));
@@ -458,8 +489,11 @@ adjust_font_weights(struct fontfam * ff)
     if (!strcmp(cfg.charset, "CP437") || ((l = getlocenvcat("LC_CTYPE")) && strstr(l, "CP437"))) {
       // accept limited range
     }
+    else if (findex) {
+      // don't report for alternative / secondary fonts
+    }
     else
-      show_font_warning(ff, _("Font has limited support for character ranges"));
+      font_warning(ff, _("Font has limited support for character ranges"));
   }
 
   // find available widths closest to selected widths
@@ -541,7 +575,7 @@ win_init_fontfamily(HDC dc, int findex)
     ff->fw_bold = min(ff->fw_norm + 300, 1000);
     // adjust selected font weights to available font weights
     trace_font(("-> Weight %d/%d\n", ff->fw_norm, ff->fw_bold));
-    adjust_font_weights(ff);
+    adjust_font_weights(ff, findex);
     trace_font(("->     -> %d/%d\n", ff->fw_norm, ff->fw_bold));
   }
   else if (ff->isbold) {
@@ -564,7 +598,7 @@ win_init_fontfamily(HDC dc, int findex)
   GetTextMetrics(dc, &tm);
   if (!tm.tmHeight) {
     // corrupt font installation (e.g. deleted font file)
-    show_font_warning(ff, _("Font installation corrupt, using system substitute"));
+    font_warning(ff, _("Font installation corrupt, using system substitute"));
     wstrset(&ff->name, W(""));
     ff->fonts[FONT_NORMAL] = create_font(ff->name, ff->fw_norm, false);
     GetObject(ff->fonts[FONT_NORMAL], sizeof(LOGFONT), &logfont);
@@ -577,7 +611,7 @@ win_init_fontfamily(HDC dc, int findex)
 #ifdef check_charset_only_for_returned_font
   int default_charset = get_default_charset();
   if (tm.tmCharSet != default_charset && default_charset != DEFAULT_CHARSET) {
-    show_font_warning(ff, _("Font does not support system locale"));
+    font_warning(ff, _("Font does not support system locale"));
   }
 #endif
 
@@ -587,15 +621,48 @@ win_init_fontfamily(HDC dc, int findex)
   GetCharWidthFloatW(dc, 0x2500, 0x2500, &line_char_width);
   GetCharWidthFloatW(dc, 0x4E00, 0x4E00, &cjk_char_width);
 
+  // avoid trouble with non-text font (#777, Noto Sans Symbols2)
+  if (!latin_char_width) {
+    //GetCharWidthFloatW(dc, 0x0020, 0x0020, &latin_char_width);
+    latin_char_width = (float)font_size / 16;
+  }
+
   if (!findex) {
-    ff->row_spacing = row_padding(tm.tmInternalLeading, tm.tmExternalLeading);
-    trace_font(("00 height %d avwidth %d asc %d dsc %d intlead %d extlead %d %ls\n", 
-               (int)tm.tmHeight, (int)tm.tmAveCharWidth, (int)tm.tmAscent, (int)tm.tmDescent, 
-               (int)tm.tmInternalLeading, (int)tm.tmExternalLeading, 
-               ff->name));
+    ff->row_spacing = 0;
+    if (cfg.auto_leading == 1) {
+      //?int ilead = tm.tmInternalLeading - (dpi - 96) / 48;
+      int idpi = dpi;  // avoid coercion of tm.tmInternalLeading to unsigned
+      int ilead = tm.tmInternalLeading * 96 / idpi;
+      ff->row_spacing = row_padding(ilead, tm.tmExternalLeading);
+      //printf("row_sp dpi %d int %d -> ild %d (ext %d) -> pad %d + cfg %d\n", dpi, (int)tm.tmInternalLeading, ilead, (int)tm.tmExternalLeading, ff->row_spacing, cfg.row_spacing);
+      trace_font(("00 height %d avwidth %d asc %d dsc %d intlead %d extlead %d %ls\n", 
+                 (int)tm.tmHeight, (int)tm.tmAveCharWidth, (int)tm.tmAscent, (int)tm.tmDescent, 
+                 (int)tm.tmInternalLeading, (int)tm.tmExternalLeading, 
+                 ff->name));
+    }
+    else if (cfg.auto_leading == 2) {
+      /*
+      	–	tmIntLeading	|	|
+      	M			|ascent	| tmHeight
+      	Mg			|	|
+      	 g	tmDescent		|
+      	–	tmExtLeading
+      */
+      if (tm.tmInternalLeading < 2)
+        ff->row_spacing += 2 - tm.tmInternalLeading;
+      else if (tm.tmInternalLeading > 7)
+        ff->row_spacing -= tm.tmExternalLeading;
+      trace_font(("vert geom: (int %d) asc %d + dsc %d -> hei %d, + ext %d; -> spc (%d) %d %ls\n", 
+                (int)tm.tmInternalLeading, (int)tm.tmAscent, (int)tm.tmDescent,
+                (int)tm.tmHeight, (int)tm.tmExternalLeading, 
+                row_spacing_1, ff->row_spacing,
+                ff->name));
+    }
+
     ff->row_spacing += cfg.row_spacing;
     if (ff->row_spacing < -tm.tmDescent)
       ff->row_spacing = -tm.tmDescent;
+    //printf("row_sp %d\n", ff->row_spacing);
     trace_font(("row spacing int %d ext %d -> %+d; add %+d -> %+d; desc %d -> %+d %ls\n", 
         (int)tm.tmInternalLeading, (int)tm.tmExternalLeading, row_padding(tm.tmInternalLeading, tm.tmExternalLeading),
         cfg.row_spacing, row_padding(tm.tmInternalLeading, tm.tmExternalLeading) + cfg.row_spacing,
@@ -631,7 +698,7 @@ win_init_fontfamily(HDC dc, int findex)
       greek_char_width >= latin_char_width * 1.5 ||
       line_char_width  >= latin_char_width * 1.5;
 
-#ifdef debug_win_char_width
+#ifdef debug_win_char_width_init
   int w_latin = win_char_width(0x0041, 0);
   int w_greek = win_char_width(0x03B1, 0);
   int w_lines = win_char_width(0x2500, 0);
@@ -764,7 +831,7 @@ win_init_fontfamily(HDC dc, int findex)
       printf("bold_mode %d font_size %d size %d bold %d diff %d %s %ls\n",
              ff->bold_mode, font_size,
              fontsize[FONT_NORMAL], fontsize[FONT_BOLD], diffsize,
-             fontsize[FONT_BOLD] != fontsize[FONT_NORMAL] ? "///" : "===",
+             fontsize[FONT_BOLD] != fontsize[FONT_NORMAL] ? "=/=" : "===",
              ff->name);
 #endif
     if (diffsize * 16 > fontsize[FONT_NORMAL]) {
@@ -797,7 +864,34 @@ wcscasestr(wstring in, wstring find)
   return 0;
 }
 
-static void
+static int CALLBACK
+enum_fonts(const LOGFONTW * lfp, const TEXTMETRICW * tmp, DWORD fontType, LPARAM lParam)
+{
+  (void)tmp;
+  (void)fontType;
+  wstring * fnp = (wstring *)lParam;
+
+#if defined(debug_fonts) && debug_fonts > 1
+  trace_font(("%ls %dx%d %d it %d cs %d %s\n", lfp->lfFaceName, (int)lfp->lfWidth, (int)lfp->lfHeight, (int)lfp->lfWeight, lfp->lfItalic, lfp->lfCharSet, (lfp->lfPitchAndFamily & 3) == FIXED_PITCH ? "fixed" : ""));
+#endif
+  if ((lfp->lfPitchAndFamily & 3) == FIXED_PITCH
+   && !lfp->lfCharSet
+   && lfp->lfFaceName[0] != '@'
+     )
+  {
+    if (wcscasestr(lfp->lfFaceName, W("Fraktur"))) {
+      *fnp = wcsdup(lfp->lfFaceName);
+      return 0;  // done
+    }
+    else if (wcscasestr(lfp->lfFaceName, W("Blackletter"))) {
+      *fnp = wcsdup(lfp->lfFaceName);
+      // continue to look for "Fraktur"
+    }
+  }
+  return 1;  // continue
+}
+
+void
 findFraktur(wstring * fnp)
 {
   LOGFONTW lf;
@@ -805,36 +899,11 @@ findFraktur(wstring * fnp)
   lf.lfPitchAndFamily = 0;
   lf.lfCharSet = ANSI_CHARSET;   // report only ANSI character range
 
-  int CALLBACK enum_fonts(const LOGFONTW * lfp, const TEXTMETRICW * tmp, DWORD fontType, LPARAM lParam)
-  {
-    (void)tmp;
-    (void)fontType;
-    wstring * fnp = (wstring *)lParam;
-
-#if defined(debug_fonts) && debug_fonts > 1
-    trace_font(("%ls %dx%d %d it %d cs %d %s\n", lfp->lfFaceName, (int)lfp->lfWidth, (int)lfp->lfHeight, (int)lfp->lfWeight, lfp->lfItalic, lfp->lfCharSet, (lfp->lfPitchAndFamily & 3) == FIXED_PITCH ? "fixed" : ""));
-#endif
-    if ((lfp->lfPitchAndFamily & 3) == FIXED_PITCH
-     && !lfp->lfCharSet
-     && lfp->lfFaceName[0] != '@'
-       )
-    {
-      if (wcscasestr(lfp->lfFaceName, W("Fraktur"))) {
-        *fnp = wcsdup(lfp->lfFaceName);
-        return 0;  // done
-      }
-      else if (wcscasestr(lfp->lfFaceName, W("Blackletter"))) {
-        *fnp = wcsdup(lfp->lfFaceName);
-        // continue to look for "Fraktur"
-      }
-    }
-    return 1;  // continue
-  }
-
   HDC dc = GetDC(0);
   EnumFontFamiliesExW(dc, 0, enum_fonts, (LPARAM)fnp, 0);
   ReleaseDC(0, dc);
 }
+
 
 /*
  * Initialize fonts for all configured font families.
@@ -878,6 +947,8 @@ win_init_fonts(int size)
 
     win_init_fontfamily(dc, fi);
   }
+  if (initinit)
+    show_font_warnings();
   initinit = false;
 
   ReleaseDC(wnd, dc);
@@ -934,7 +1005,7 @@ win_zoom_font(int zoom, bool sync_size_with_font)
 
 static HDC dc;
 static enum { UPDATE_IDLE, UPDATE_BLOCKED, UPDATE_PENDING } update_state;
-static bool ime_open;
+static bool ime_open = false;
 
 static int update_skipped = 0;
 int lines_scrolled = 0;
@@ -971,7 +1042,11 @@ init_charnametable()
   }
 
   char * cnfn = get_resource_file(W("info"), W("charnames.txt"), false);
-  FILE * cnf = fopen(cnfn, "r");
+  FILE * cnf = 0;
+  if (cnfn) {
+    cnf = fopen(cnfn, "r");
+    free(cnfn);
+  }
   if (cnf) {
     uint cc;
     char cn[100];
@@ -1167,6 +1242,7 @@ do_update(void)
 #if defined(debug_cursor) && debug_cursor > 1
   printf("do_update cursor_on %d @%d,%d\n", term.cursor_on, term.curs.y, term.curs.x);
 #endif
+  //printf("do_update state %d susp %d\n", update_state, term.suspend_update);
   if (update_state == UPDATE_BLOCKED) {
     update_state = UPDATE_IDLE;
     return;
@@ -1177,13 +1253,20 @@ do_update(void)
   lines_scrolled = 0;
   if ((update_skipped < cfg.display_speedup && cfg.display_speedup < 10
        && output_speed > update_skipped
-      ) || win_is_iconic()
+       //&& !term.smooth_scroll ?
+      ) || (!term.detect_progress && win_is_iconic())
+        //|| win_is_hidden() ?
+        // suspend display update:
+        //|| (update_skipped < term.suspend_update * cfg.display_speedup)
+        || (update_skipped * update_timer < term.suspend_update)
      )
   {
+    //printf("skip %d susp %d\n", update_skipped, term.suspend_update);
     win_set_timer(do_update, update_timer);
     return;
   }
   update_skipped = 0;
+  term.suspend_update = 0;
 
   update_state = UPDATE_BLOCKED;
 
@@ -1194,8 +1277,12 @@ do_update(void)
   win_paint_exclude_search(dc);
   term_update_search();
 
-  term_paint();
-  winimg_paint();
+  if (tek_mode)
+    tek_paint();
+  else {
+    term_paint();
+    winimgs_paint();
+  }
 
   ReleaseDC(wnd, dc);
 
@@ -1219,7 +1306,7 @@ do_update(void)
   // so we should arrange to have one.)
   if (term.has_focus) {
     int x = term.curs.x * cell_width + PADDING;
-    int y = (term.curs.y - term.disptop) * cell_height + PADDING;
+    int y = (term.curs.y - term.disptop) * cell_height + OFFSET + PADDING;
     SetCaretPos(x, y);
     if (ime_open) {
       COMPOSITIONFORM cf = {.dwStyle = CFS_POINT, .ptCurrentPos = {x, y}};
@@ -1267,7 +1354,7 @@ sel_update(bool update_sel_tip)
     int y = wr.top
           + ((style & WS_THICKFRAME) ? GetSystemMetrics(SM_CYSIZEFRAME) : 0)
           + ((style & WS_CAPTION) ? GetSystemMetrics(SM_CYCAPTION) : 0)
-          + PADDING + last_pos.y * cell_height;
+          + OFFSET + PADDING + last_pos.y * cell_height;
 #ifdef debug_selection_show_size 
     cfg.selection_show_size = cfg.selection_show_size % 12 + 1;
 #endif
@@ -1382,6 +1469,10 @@ another_font(struct fontfam * ff, int fontno)
   if (fontno & FONT_ZOOMSMALL) {
     y = y * 12 / 20;
     x = x * 12 / 20;
+  }
+  if (fontno & FONT_ZOOMDOWN) {
+    y = y / 2;
+    x = x / 2;
   }
 
 #ifdef debug_create_font
@@ -1645,7 +1736,7 @@ load_background_image_brush(HDC dc, wstring fn)
       static wchar * prevbg = 0;
       bool isnewbg = !prevbg || wcscmp(cfg.background, prevbg);
       printf("isnewbg %d <%ls> <%ls>\n", isnewbg, cfg.background, prevbg);
-      if (ratio && isnewbg && abs(bw * h - bh * w) > 5) {
+      if (ratio && isnewbg && abs((int)bw * h - (int)bh * w) > 5) {
         if (prevbg)
           free(prevbg);
         prevbg = wcsdup(cfg.background);
@@ -1661,7 +1752,7 @@ load_background_image_brush(HDC dc, wstring fn)
         int sy = win_search_visible() ? SEARCHBAR_HEIGHT : 0;
         printf("%dx%d (%dx%d) -> %dx%d\n", (int)h, (int)w, bh, bw, xh, xw);
         // rescale window to aspect ratio of background image
-        win_set_pixels(xh - 2 * PADDING - sy, xw - 2 * PADDING);
+        win_set_pixels(xh - 2 * PADDING - OFFSET - sy, xw - 2 * PADDING);
         // WARNING: rescaling asynchronously at this point makes 
         // terminal geometry (term.rows, term.cols) inconsistent with 
         // running operations and may crash mintty; 
@@ -1693,7 +1784,7 @@ load_background_image_brush(HDC dc, wstring fn)
         // set half-tone stretch-blit mode for scaling quality
         SetStretchBltMode(dc1, HALFTONE);
         // draw the bitmap scaled into the destination memory DC
-        StretchBlt(dc1, 0, 0, w, h, dc0, 0, 0, bw, bh, SRCCOPY);
+        StretchBlt(dc1, 0, OFFSET, w, h - OFFSET, dc0, 0, 0, bw, bh, SRCCOPY);
 
         DeleteObject(hbm);
         hbm = hbm1;
@@ -1712,7 +1803,7 @@ load_background_image_brush(HDC dc, wstring fn)
 
         BYTE alphafmt = alpha == 255 ? AC_SRC_ALPHA : 0;
         BLENDFUNCTION bf = (BLENDFUNCTION) {AC_SRC_OVER, 0, alpha, alphafmt};
-        if (pAlphaBlend(dc1, 0, 0, w, h, dc0, 0, 0, bw, bh, bf)) {
+        if (pAlphaBlend(dc1, 0, OFFSET, w, h - OFFSET, dc0, 0, 0, bw, bh, bf)) {
           DeleteObject(hbm);
           hbm = hbm1;
         }
@@ -1746,6 +1837,8 @@ load_background_image_brush(HDC dc, wstring fn)
       if (bgbrush_bmp) {
         RECT cr;
         GetClientRect(wnd, &cr);
+        // support tabbar
+        cr.top += OFFSET;
 
         /* By applying this tweak here and (!) in fill_background below,
            we can apply an offset to the origin of a wallpaper background, 
@@ -1914,7 +2007,7 @@ get_bg_filename(void)
       }
       else {
         // need to scale wallpaper later, when loading;
-        /// not implemented, invalidate
+        // not implemented, invalidate
         *wallpfn = 0;
         // possibly, according to docs, but apparently ignored, 
         // also determine origin according to
@@ -1997,6 +2090,9 @@ load_background_brush(HDC dc)
   if (win_search_visible())
     cr.bottom -= SEARCHBAR_HEIGHT;
 
+  // support tabbar (minor need here)
+  cr.top += OFFSET;
+
   wchar * bgfn = get_bg_filename();  // also set tiled and alpha
 
   HBITMAP
@@ -2057,13 +2153,17 @@ load_background_brush(HDC dc)
   free(bgfn);
 }
 
-static bool
+bool
 fill_background(HDC dc, RECT * boxp)
 {
   load_background_brush(dc);
   if (wallp) {
     offset_bg(dc);
   }
+
+  // support tabbar
+  if (boxp->top < OFFSET)
+    boxp->top = OFFSET;
 
   return
     (bgbrush_bmp && FillRect(dc, boxp, bgbrush_bmp))
@@ -2103,7 +2203,7 @@ scale_to_image_ratio()
   printf("  cur w %d h %d img bw %d bh %d\n", (int)w, (int)h, bw, bh);
 #endif
 
-  if (abs(bw * h - bh * w) < w + h)
+  if (abs((int)bw * h - (int)bh * w) < w + h)
     return;
 
   w = max(w, ini_width);
@@ -2125,7 +2225,7 @@ scale_to_image_ratio()
   printf("  %dx%d (%dx%d) -> %dx%d\n", (int)w, (int)h, bw, bh, xw, xh);
 #endif
   // rescale window to aspect ratio of background image
-  win_set_pixels(xh - 2 * PADDING - sy, xw - 2 * PADDING);
+  win_set_pixels(xh - 2 * PADDING - OFFSET - sy, xw - 2 * PADDING);
 #endif
 }
 
@@ -2257,12 +2357,18 @@ text_out_start(HDC hdc, LPCWSTR psz, int cch, int *dxs)
   if (!use_uniscribe)
     return;
 
+#if CYGWIN_VERSION_API_MINOR >= 74
+  static SCRIPT_CONTROL sctrl_lig = (SCRIPT_CONTROL){.fMergeNeutralItems = 1};
+#else
+  SCRIPT_CONTROL sctrl_lig = (SCRIPT_CONTROL){.fReserved = 1};
+#endif
   HRESULT hr = ScriptStringAnalyse(hdc, psz, cch, 0, -1, 
     // could | SSA_FIT and use `width` (from win_text) instead of MAXLONG
     // to justify to monospace cell widths;
     // SSA_LINK is needed for Hangul and default-size CJK
     SSA_GLYPHS | SSA_FALLBACK | SSA_LINK, MAXLONG, 
-    NULL, NULL, dxs, NULL, NULL, &ssa);
+    cfg.ligatures > 1 ? &sctrl_lig : 0, 
+    NULL, dxs, NULL, NULL, &ssa);
   if (!SUCCEEDED(hr) && hr != USP_E_SCRIPT_NOT_IN_FONT)
     use_uniscribe = false;
 }
@@ -2276,7 +2382,7 @@ text_out(HDC hdc, int x, int y, UINT fuOptions, RECT *prc, LPCWSTR psz, int cch,
   if (*psz >= 0x80) {
     printf("@%3d (%3d):", x, y);
     for (int i = 0; i < cch; i++)
-      printf(" %04X", psz[i]);
+      printf(" %04X<%d>", psz[i], dxs[i]);
     printf("\n");
   }
 #endif
@@ -2354,7 +2460,9 @@ old_apply_attr_colour(cattr a, attr_colour_mode mode)
   // indexed modifications
   bool do_reverse_i = mode & (ACM_RTF_PALETTE | ACM_RTF_GEN);
   bool do_bold_i = mode & (ACM_TERM | ACM_RTF_PALETTE | ACM_RTF_GEN | ACM_SIMPLE | ACM_VBELL_BG);
+#ifdef handle_blinking_here
   bool do_blink_i = mode & (ACM_TERM | ACM_RTF_PALETTE | ACM_RTF_GEN);
+#endif
   bool do_finalize_rtf_i = mode & (ACM_RTF_PALETTE | ACM_RTF_GEN);
   bool do_rtf_bold_decolour_i = mode & (ACM_RTF_GEN);
 
@@ -2371,12 +2479,15 @@ old_apply_attr_colour(cattr a, attr_colour_mode mode)
   if (do_bold_i && (a.attr & ATTR_BOLD))    // rtf_bold_decolour uses ATTR_BOLD
     reset_bold = !old_apply_bold_colour(&fgi);  // we'll reset afterwards if needed
 
+#ifdef handle_blinking_here
+  // this is handled in term_paint
   if (do_blink_i && (a.attr & ATTR_BLINK)) {
     if (CCL_ANSI8(bgi))
       bgi |= 8;
     else if (CCL_DEFAULT(bgi))
       bgi |= 1;
   }
+#endif
 
   if (do_finalize_rtf_i) {
     if (do_rtf_bold_decolour_i) {  // uses ATTR_BOLD, ATTR_REVERSE
@@ -2450,11 +2561,15 @@ apply_bold_colour(colour_i *pfgi)
       *pfgi |= 8;  // (BLACK|...|WHITE)_I -> BOLD_(BLACK|...|WHITE)_I
     return true;  // both thickened
   }
-  // switchable bold_colour
+  // switchable attribute colours
   if (term.enable_bold_colour && CCL_DEFAULT(*pfgi)
       && colours[BOLD_COLOUR_I] != (colour)-1
      )
     *pfgi = BOLD_COLOUR_I;
+  else if (term.enable_blink_colour && CCL_DEFAULT(*pfgi)
+      && colours[BLINK_COLOUR_I] != (colour)-1
+     )
+    *pfgi = BLINK_COLOUR_I;
   else
   // normal independent as_font/as_colour controls
   if (cfg.bold_as_colour) {
@@ -2503,7 +2618,9 @@ apply_attr_colour(cattr a, attr_colour_mode mode)
   // indexed modifications
   bool do_reverse_i = mode & (ACM_RTF_PALETTE | ACM_RTF_GEN);
   bool do_bold_i = mode & (ACM_TERM | ACM_RTF_PALETTE | ACM_RTF_GEN | ACM_SIMPLE | ACM_VBELL_BG);
+#ifdef handle_blinking_here
   bool do_blink_i = mode & (ACM_TERM | ACM_RTF_PALETTE | ACM_RTF_GEN);
+#endif
   bool do_finalize_rtf_i = mode & (ACM_RTF_PALETTE | ACM_RTF_GEN);
   bool do_rtf_bold_decolour_i = mode & (ACM_RTF_GEN);
 
@@ -2520,12 +2637,15 @@ apply_attr_colour(cattr a, attr_colour_mode mode)
   if (do_bold_i && (a.attr & ATTR_BOLD))    // rtf_bold_decolour uses ATTR_BOLD
     reset_bold = !apply_bold_colour(&fgi);  // we'll reset afterwards if needed
 
+#ifdef handle_blinking_here
+  // this is handled in term_paint
   if (do_blink_i && (a.attr & ATTR_BLINK)) {
     if (CCL_ANSI8(bgi))
       bgi |= 8;
     else if (CCL_DEFAULT(bgi))
       bgi |= 1;
   }
+#endif
 
   if (do_finalize_rtf_i) {
     if (do_rtf_bold_decolour_i) {  // uses ATTR_BOLD, ATTR_REVERSE
@@ -2573,6 +2693,9 @@ apply_attr_colour(cattr a, attr_colour_mode mode)
 
   // ACM_TERM does also search and cursor colours. for now we don't handle those
 
+  if (a.attr & TATTR_CLEAR)
+    bg = brighten(bg, fg, false);
+
   a.truefg = fg;
   a.truebg = bg;
   a.attr |= TRUE_COLOUR << ATTR_FGSHIFT | TRUE_COLOUR << ATTR_BGSHIFT;
@@ -2590,10 +2713,16 @@ apply_attr_colour(cattr a, attr_colour_mode mode)
 void
 win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, ushort lattr, bool has_rtl, bool clearpad, uchar phase)
 {
+#ifdef debug_wscale
+  if (attr.attr & (TATTR_EXPAND | TATTR_NARROW | TATTR_WIDE))
+    for (int i = 0; i < len; i++)
+      printf("[%2d:%2d] %c%c%c%c %04X\n", ty, tx + i, attr.attr & TATTR_NARROW ? 'n' : ' ', attr.attr & TATTR_EXPAND ? 'x' : ' ', attr.attr & TATTR_WIDE ? 'w' : ' ', " WUL"[lattr & LATTR_MODE], text[i]);
+#endif
   //if (kb_trace) {printf("[%ld] <win_text\n", mtime()); kb_trace = 0;}
 
   int graph = (attr.attr & GRAPH_MASK) >> ATTR_GRAPH_SHIFT;
   bool graph_vt52 = false;
+  bool powerline = false;
   int findex = (attr.attr & FONTFAM_MASK) >> ATTR_FONTFAM_SHIFT;
   // in order to save attributes bits, special graphic handling is encoded 
   // in a compact form, combined with unused values of the font number;
@@ -2610,6 +2739,10 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
   if (findex > 10) {
     if (findex == 12) // VT100 scanlines
       graph <<= 4;
+    else if (findex == 13 && graph == 15) { // Private: geometric Powerline
+      graph = 0;
+      powerline = true;
+    }
     else if (findex == 13) { // VT52 scanlines
       graph <<= 4;
       graph_vt52 = true;
@@ -2645,10 +2778,26 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
 
  /* Convert to window coordinates */
   int x = tx * char_width + PADDING;
-  int y = ty * cell_height + PADDING;
+  int y = ty * cell_height + OFFSET + PADDING;
 
-  if (attr.attr & ATTR_WIDE)
+#ifdef support_triple_width
+#define TATTR_TRIPLE 0x0080000000000000u
+  if ((attr.attr & TATTR_TRIPLE) == TATTR_TRIPLE) {
+    char_width *= 3;
+    attr.attr &= ~TATTR_TRIPLE;
+  }
+  else
+#endif
+  if (attr.attr & TATTR_WIDE)
     char_width *= 2;
+
+  bool wscale_narrow_50 = false;
+  if ((attr.attr & (TATTR_NARROW | TATTR_CLEAR)) == (TATTR_NARROW | TATTR_CLEAR)) {
+    // indicator for adjustment of auto-narrowing;
+    // geometric Powerline symbols, explicit single-width attribute narrowing
+    attr.attr &= ~TATTR_CLEAR;
+    wscale_narrow_50 = true;
+  }
 
   bool default_bg = (attr.attr & ATTR_BGMASK) >> ATTR_BGSHIFT == BG_COLOUR_I;
   if (attr.attr & ATTR_REVERSE)
@@ -2684,6 +2833,7 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
       default_bg = false;
 
     cursor_colour = colours[ime_open ? IME_CURSOR_COLOUR_I : CURSOR_COLOUR_I];
+    //printf("cc (ime_open %d) %06X\n", ime_open, cursor_colour);
 
     //static uint mindist = 32768;
     static uint mindist = 22222;
@@ -2708,7 +2858,7 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
         fg = bg;
       bg = cursor_colour;
 #ifdef debug_cursor
-      printf("set cursor (colour %06X) @(row %d col %d) cursor_on %d\n", bg, (y - PADDING) / cell_height, (x - PADDING) / char_width, term.cursor_on);
+      printf("set cursor (colour %06X) @(row %d col %d) cursor_on %d\n", bg, (y - PADDING - OFFSET) / cell_height, (x - PADDING) / char_width, term.cursor_on);
 #endif
     }
   }
@@ -2721,11 +2871,25 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
     otherwise:       nfont = FONT_WIDE + FONT_HIGH;
   }
 
-  if (attr.attr & ATTR_EXPAND)
+  int wscale = 100;
+
+  if (attr.attr & TATTR_EXPAND) {
+    if (nfont & FONT_WIDE)
+      wscale = 200;
     nfont |= FONT_WIDE;
-  else
-  if (attr.attr & ATTR_NARROW)
+  }
+  else if (wscale_narrow_50)
+    wscale = 50;
+#ifndef narrow_via_font
+  else if ((attr.attr & TATTR_NARROW) && !(attr.attr & TATTR_ZOOMFULL)) {
+    wscale = cfg.char_narrowing;
+    if (wscale > 100)
+      wscale = 100;
+    if (wscale < 50)
+      wscale = 50;
     nfont |= FONT_NARROW;
+  }
+#endif
 
   bool do_special_underlay = false;
   if (cfg.bold_as_special && (attr.attr & ATTR_BOLD)) {
@@ -2749,6 +2913,8 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
     nfont |= FONT_ZOOMFULL;
   if (attr.attr & (ATTR_SUBSCR | ATTR_SUPERSCR))
     nfont |= FONT_ZOOMSMALL;
+  if (attr.attr & TATTR_SINGLE)
+    nfont |= FONT_ZOOMDOWN;
   another_font(ff, nfont);
 
   bool force_manual_underline = false;
@@ -2758,8 +2924,11 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
     // Don't force manual bold, it could be bad news.
     nfont &= ~(FONT_BOLD | FONT_UNDERLINE);
   }
+#ifdef narrow_via_font
   if ((nfont & (FONT_WIDE | FONT_NARROW)) == (FONT_WIDE | FONT_NARROW))
     nfont &= ~(FONT_WIDE | FONT_NARROW);
+#endif
+
   another_font(ff, nfont);
   if (!ff->fonts[nfont])
     nfont = FONT_NORMAL;
@@ -2836,10 +3005,19 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
     }
   }
 
+  wchar * origtext = 0;
   if (graph && graph < 0xE0) {
     // clear codes for Block Elements, VT100 Line Drawing and "scanlines"
     for (int i = 0; i < len; i++)
       text[i] = ' ';
+  }
+  else if (powerline) {
+    origtext = newn(wchar, len);
+    // clear codes for Powerline geometric symbols
+    for (int i = 0; i < len; i++) {
+      origtext[i] = text[i];
+      text[i] = ' ';
+    }
   }
 
  /* Array with offsets between neighbouring characters */
@@ -2970,6 +3148,8 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
  /* Graphic background: picture or texture */
   if (*cfg.background && default_bg) {
     RECT bgbox = box0;
+
+    // extend into padding area
     if (!tx)
       bgbox.left = 0;
     if (bgbox.right >= PADDING + cell_width * term.cols)
@@ -2986,9 +3166,13 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
 
     if (fill_background(dc, &bgbox))
       underlaid = true;
+#ifdef debug_text_background
+    if (*text != 'x')
+      underlaid = false;
+#endif
   }
 
- /* Coordinate transformation */
+ /* Coordinate transformation per line */
   int coord_transformed = 0;
   XFORM old_xform;
   if (lpresrtl) {
@@ -3048,6 +3232,8 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
     else
       yt += cell_height * 1 / 8;
   }
+  if (attr.attr & TATTR_SINGLE)
+    yt += cell_height / 4;
 
  /* Shadow */
   int layer = 0;
@@ -3064,7 +3250,46 @@ win_text(int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, usho
     SetTextColor(dc, fg);
   }
 
+  int bloom = 0;
+  XFORM old_xform_bloom;
+  int coord_transformed_bloom = 0;
+  if (cfg.bloom) {
+    bloom = 2;
+    fg = ((fg & 0xFEFEFEFE) >> 1) + ((win_get_colour(BG_COLOUR_I) & 0xFEFEFEFE) >> 1);
+    SetTextColor(dc, fg);
+  }
+
 draw:;
+  if (bloom) {
+    if (bloom > 1 || bloom >= 1)
+      fg = ((fg & 0xFEFEFEFE) >> 1) + ((win_get_colour(BG_COLOUR_I) & 0xFEFEFEFE) >> 1);
+    else {
+      colour fg2 = (fg & 0xFEFEFEFE) >> 1;
+      colour bg2 = (win_get_colour(BG_COLOUR_I) & 0xFEFEFEFE) >> 1;
+      colour fg4 = (fg & 0xFCFCFCFC) >> 2;
+      colour bg4 = (win_get_colour(BG_COLOUR_I) & 0xFCFCFCFC) >> 2;
+      fg = fg2 + fg4 + bg2 + bg4;
+    }
+    SetTextColor(dc, fg);
+    SelectObject(dc, ff->fonts[nfont | FONT_BOLD]);
+
+    coord_transformed_bloom = SetGraphicsMode(dc, GM_ADVANCED);
+    if (coord_transformed_bloom && GetWorldTransform(dc, &old_xform_bloom)) {
+      clear_run();
+
+      float scale = 1.0 + (float)bloom / 7.0;
+      /*
+        xt' = xt + cell_width / 2
+        x' - xt' = sc * (x - xt')
+        x' = xt' + sc * x - sc * xt'
+        x' = sc * x + (1 - sc) * xt'
+      */
+      XFORM xform = (XFORM){scale, 0.0, 0.0, scale, 
+                    ((float)xt + (float)cell_width / 2) * (1.0 - scale), 
+                    ((float)yt + (float)cell_height / 2) * (1.0 - scale)};
+      coord_transformed_bloom = ModifyWorldTransform(dc, &xform, MWT_LEFTMULTIPLY);
+    }
+  }
 #ifdef debug_draw
   if (*text != ' ')
     printf("draw @%d:%d %d:%d %d:%d\n", ty, tx, yt, xt, y, x);
@@ -3172,6 +3397,8 @@ draw:;
     DeleteObject(oldpen);
   }
 
+  int dxs_[len];
+
  /* Background for overhang overlay */
   if (ldisp1) {
     if (!underlaid)
@@ -3193,6 +3420,39 @@ draw:;
         text[i] = 0x2502;
     else if (graph == 0xF7)  // VT52 fraction numerator
       yt -= line_width;
+  }
+
+ /* Coordinate transformation per character */
+  int coord_transformed2 = 0;
+  XFORM old_xform2;
+  RECT box_, box2_;
+  if (wscale != 100) {
+    coord_transformed2 = SetGraphicsMode(dc, GM_ADVANCED);
+    if (coord_transformed2 && GetWorldTransform(dc, &old_xform2)) {
+      clear_run();
+
+      float scale = (float)wscale / 100.0;
+      XFORM xform = (XFORM){scale, 0.0, 0.0, 1.0, xt * (1.0 - scale), 0.0};
+      coord_transformed2 = ModifyWorldTransform(dc, &xform, MWT_LEFTMULTIPLY);
+      if (coord_transformed2) {
+        for (int i = 0; i < len; i++)
+          dxs_[i] = dxs[i];
+        box_ = box;
+        box2_ = box2;
+        // compensate for the scaling
+        for (int i = 0; i < len; i++)
+          dxs[i] /= scale;
+        if (wscale <= 100) {
+          box.right /= scale;
+          box2.right /= scale;
+        }
+        else { // evolutionary algorithm; don't ask why or how it works :/
+        // extend bounding box by the scaling
+          box.right *= scale;
+          box2.right *= scale;
+        }
+      }
+    }
   }
 
  /* Finally, draw the text */
@@ -3217,8 +3477,8 @@ draw:;
 
   if (combining || combining_double)
     *dxs = char_width;  // convince Windows to apply font underlining
-  text_out_start(dc, text, len, dxs);
 
+  text_out_start(dc, text, len, dxs);
   for (int xoff = 0; xoff < xwidth; xoff++)
     if (combining || combining_double) {
       // Workaround for mangled display of combining characters;
@@ -3267,6 +3527,15 @@ draw:;
       }
     }
   text_out_end();
+
+  if (coord_transformed2) {
+    SetWorldTransform(dc, &old_xform2);
+    // restore these in case we're in a shadow loop
+    for (int i = 0; i < len; i++)
+      dxs[i] = dxs_[i];
+    box = box_;
+    box2 = box2_;
+  }
 
  /* Manual drawing of certain graphics */
   // line_width already set above for DEC Tech adjustments
@@ -3402,9 +3671,12 @@ draw:;
       DeleteObject(oldpen);
     }
   }
-  else if (graph >= 0x80 && !graph_vt52) {  // Unicode Block Elements
+  else if ((graph >= 0x80 && !graph_vt52) || powerline) {  // drawn graphics
     // Block Elements (U+2580-U+259F)
     // ▀▁▂▃▄▅▆▇█▉▊▋▌▍▎▏▐░▒▓▔▕▖▗▘▙▚▛▜▝▞▟
+    // Private Use geometric Powerline symbols (U+E0B0-U+E0BF, not 5, 7)
+    // 
+    //      - -
     int char_height = cell_height;
     if (lattr >= LATTR_TOP)
       char_height *= 2;
@@ -3434,6 +3706,70 @@ draw:;
       MoveToEx(dc, xi + l, y0 + t, null);
       LineTo(dc, xi + r, y0 + b);
       DeleteObject(SelectObject(dc, oldpen));
+    }
+    void lines(char x1, char y1, char x2, char y2, char x3, char y3)
+    {
+      int _x1 = char_width * x1 / 8;
+      int _y1 = char_height * y1 / 8;
+      int _x2 = char_width * x2 / 8;
+      int _y2 = char_height * y2 / 8;
+      int _x3 = char_width * x3 / 8;
+      int _y3 = char_height * y3 / 8;
+      if (x2) {
+        _x1--; _x2--; _x3--;
+      }
+
+      int w = y3 >= 0 ? line_width : 0;
+      HPEN oldpen = SelectObject(dc, CreatePen(PS_SOLID, w, fg));
+      MoveToEx(dc, xi + _x1, y0 + _y1, null);
+      LineTo(dc, xi + _x2, y0 + _y2);
+      if (y3 >= 0) {
+        MoveToEx(dc, xi + _x3, y0 + _y3 - 1, null);
+        LineTo(dc, xi + _x2, y0 + _y2 - 1);
+      }
+      DeleteObject(SelectObject(dc, oldpen));
+    }
+    void trio(char x1, char y1, char x2, char y2, char x3, char y3, bool chord)
+    {
+      int _x1 = char_width * x1 / 8;
+      int _y1 = char_height * y1 / 8;
+      int _x2 = char_width * x2 / 8;
+      int _y2 = char_height * y2 / 8;
+      int _x3 = char_width * x3 / 8;
+      int _y3 = char_height * y3 / 8;
+      if (x1) _x1--;
+      if (x2) _x2--;
+      if (x3) _x3--;
+      if (y2 == 8) _y2--;
+      _y3--;
+      if (chord && !x1) {
+        _x1++; _x2++; _x3++;
+      }
+
+      HPEN oldpen = SelectObject(dc, CreatePen(PS_SOLID, 0, fg));
+      HBRUSH oldbrush = SelectObject(dc, CreateSolidBrush(fg));
+      if (chord) {
+        if (x1)
+          Chord(dc, xi, y0 + _y1, xi + 2 * _x1, y0 + _y3,
+                    xi + _x1, y0 + _y1, xi + _x3, y0 + _y3);
+        else
+          Chord(dc, xi - _x2, y0 + _y1, xi + x2, y0 + _y3,
+                    xi + _x3, y0 + _y3, xi + _x1, y0 + _y1);
+      }
+      else
+        Polygon(dc, (POINT[]){{xi + _x1, y0 + _y1},
+                              {xi + _x2, y0 + _y2},
+                              {xi + _x3, y0 + _y3}}, 3);
+      DeleteObject(SelectObject(dc, oldbrush));
+      DeleteObject(SelectObject(dc, oldpen));
+    }
+    void triangle(char x1, char y1, char x2, char y2, char x3, char y3)
+    {
+      trio(x1, y1, x2, y2, x3, y3, false);
+    }
+    void trichord(char x1, char y1, char x2, char y2, char x3, char y3)
+    {
+      trio(x1, y1, x2, y2, x3, y3, true);
     }
     void rectdraw(char l, char t, char r, char b, char sol, colour c)
     {
@@ -3507,14 +3843,44 @@ draw:;
     }
 
     for (int i = 0; i < ulen; i++) {
-      switch (graph) {
+      if (powerline && origtext) switch (origtext[i]) {
+        when 0xE0B0:
+          triangle(0, 0, 8, 4, 0, 8);
+        when 0xE0B1:
+          lines(0, 0, 8, 4, 0, 8);
+        when 0xE0B2:
+          triangle(8, 0, 0, 4, 8, 8);
+        when 0xE0B3:
+          lines(8, 0, 0, 4, 8, 8);
+        when 0xE0B4:
+          trichord(0, 0, 8, 4, 0, 8);
+        when 0xE0B6:
+          trichord(8, 0, 0, 4, 8, 8);
+        when 0xE0B8:
+          triangle(0, 0, 0, 8, 8, 8);
+        when 0xE0B9:
+          lines(0, 0, 8, 8, -1, -1);
+        when 0xE0BA:
+          triangle(8, 0, 8, 8, 0, 8);
+        when 0xE0BB:
+          lines(8, 0, 0, 8, -1, -1);
+        when 0xE0BC:
+          triangle(0, 0, 8, 0, 0, 8);
+        when 0xE0BD:
+          lines(8, 0, 0, 8, -1, -1);
+        when 0xE0BE:
+          triangle(0, 0, 8, 0, 8, 8);
+        when 0xE0BF:
+          lines(0, 0, 8, 8, -1, -1);
+      } else switch (graph) {
+        // ▀▁▂▃▄▅▆▇█▉▊▋▌▍▎▏▐░▒▓▔▕▖▗▘▙▚▛▜▝▞▟
         when 0x80: rect(0, 0, 8, 4); // UPPER HALF BLOCK
         when 0x81 ... 0x88: rect(0, 0x88 - graph, 8, 8); // LOWER EIGHTHS
         when 0x89 ... 0x8F: rect(0, 0, 0x90 - graph, 8); // LEFT EIGHTHS
         when 0x90: rect(4, 0, 8, 8); // RIGHT HALF BLOCK
-        when 0x91: rectsolcol(0, 0, 8, 8, 2);
-        when 0x92: rectsolcol(0, 0, 8, 8, 3);
-        when 0x93: rectsolcol(0, 0, 8, 8, 5);
+        when 0x91: rectsolcol(0, 0, 8, 8, 2); // ░ LIGHT SHADE
+        when 0x92: rectsolcol(0, 0, 8, 8, 3); // ▒ MEDIUM SHADE
+        when 0x93: rectsolcol(0, 0, 8, 8, 5); // ▓ DARK SHADE
         when 0x94: rect(0, 0, 8, 1); // UPPER ONE EIGHTH BLOCK
         when 0x95: rect(7, 0, 8, 8); // RIGHT ONE EIGHTH BLOCK
         when 0x96: rect(0, 4, 4, 8);
@@ -3617,6 +3983,9 @@ draw:;
     DeleteObject(oldpen);
   }
 
+  if (origtext)
+    free(origtext);
+
   show_curchar_info('w');
   if (has_cursor) {
     colour _cc = cursor_colour;
@@ -3633,18 +4002,33 @@ draw:;
           Rectangle(dc, x, y, x + char_width, y + cell_height);
           SelectObject(dc, oldbrush);
         }
+      when CUR_BOX: {
+        HBRUSH oldbrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, x, y, x + char_width, y + cell_height);
+        SelectObject(dc, oldbrush);
+      }
       when CUR_LINE: {
         int caret_width = 1;
         SystemParametersInfo(SPI_GETCARETWIDTH, 0, &caret_width, 0);
-        if (caret_width > char_width)
-          caret_width = char_width;
+        // limit line cursor width by char_width? rather by line_width (#1101)
+        if (caret_width > line_width)
+          caret_width = line_width;
         int xx = x;
         if (attr.attr & TATTR_RIGHTCURS)
           xx += char_width - caret_width;
         if (attr.attr & TATTR_ACTCURS) {
+#ifdef cursor_painted_with_rectangle
+          // this would add an additional line, vanishing again but 
+          // leaving a pixel artefact, under some utterly weird interference 
+          // with output of certain characters (mintty/wsltty#255)
           HBRUSH oldbrush = SelectObject(dc, CreateSolidBrush(_cc));
           Rectangle(dc, xx, y, xx + caret_width, y + cell_height);
           DeleteObject(SelectObject(dc, oldbrush));
+#else
+          HBRUSH br = CreateSolidBrush(_cc);
+          FillRect(dc, &(RECT){xx, y, xx + caret_width, y + cell_height}, br);
+          DeleteObject(br);
+#endif
         }
         else if (attr.attr & TATTR_PASCURS) {
           for (int dy = 0; dy < cell_height; dy += 2)
@@ -3660,8 +4044,35 @@ draw:;
           if (lattr == LATTR_BOT)
             yy += cell_height;
         }
-        if (attr.attr & TATTR_ACTCURS)
-          Rectangle(dc, x, yy, x + char_width, yy + 2);
+        if (attr.attr & TATTR_ACTCURS) {
+	  /* cursor size CSI ? N c
+	     from linux console https://linuxgazette.net/137/anonymous.html
+		0   default
+		1   invisible
+		2   underscore
+		3   lower_third
+		4   lower_half
+		5   two_thirds
+		6   full block
+          */
+          int up = 0;
+          switch (term.cursor_size) {
+            when 1: up = -2;
+            when 2: up = line_width - 1;
+            when 3: up = cell_height / 3 - 1;
+            when 4: up = cell_height / 2;
+            when 5: up = cell_height * 2 / 3;
+            when 6: up = cell_height - 2;
+          }
+          if (up) {
+            int yct = max(yy - up, yt);
+            HBRUSH oldbrush = SelectObject(dc, CreateSolidBrush(_cc));
+            Rectangle(dc, x, yct, x + char_width, yy + 2);
+            DeleteObject(SelectObject(dc, oldbrush));
+          }
+          else
+            Rectangle(dc, x, yy - up, x + char_width, yy + 2);
+        }
         else if (attr.attr & TATTR_PASCURS) {
           for (int dx = 0; dx < char_width; dx += 2) {
             SetPixel(dc, x + dx, yy, _cc);
@@ -3674,6 +4085,16 @@ draw:;
   }
 
   _return:
+
+  if (bloom && coord_transformed_bloom) {
+    bloom--;
+    SetWorldTransform(dc, &old_xform_bloom);
+    fg = fg0;
+    SetTextColor(dc, fg);
+    if (!bloom)
+      SelectObject(dc, ff->fonts[nfont]);
+    goto draw;
+  }
 
   if (layer) {
     layer--;
@@ -3730,6 +4151,7 @@ win_check_glyphs(wchar *wcs, uint num, cattrflags attr)
   int findex = (attr & FONTFAM_MASK) >> ATTR_FONTFAM_SHIFT;
   if (findex > 10)
     findex = 0;
+
   struct fontfam * ff = &fontfamilies[findex];
 
   HFONT f = font4(ff, attr);
@@ -3738,6 +4160,22 @@ win_check_glyphs(wchar *wcs, uint num, cattrflags attr)
   SelectObject(dc, f);
   ushort glyphs[num];
   GetGlyphIndicesW(dc, wcs, num, glyphs, true);
+
+  // recheck for characters affected by FontChoice
+  for (uint i = 0; i < num; i++) {
+    uchar cf = scriptfont(wcs[i]);
+#ifdef debug_scriptfonts
+    if (wcs[i] && cf)
+      printf("scriptfont %04X: %d\n", wcs[i], cf);
+#endif
+    if (cf && cf <= 10) {
+      struct fontfam * ff = &fontfamilies[cf];
+      f = font4(ff, attr);
+      SelectObject(dc, f);
+      GetGlyphIndicesW(dc, &wcs[i], 1, &glyphs[i], true);
+    }
+  }
+
   for (uint i = 0; i < num; i++) {
     if (glyphs[i] == 0xFFFF || glyphs[i] == 0x1F)
       wcs[i] = 0;
@@ -3759,15 +4197,18 @@ win_check_glyphs(wchar *wcs, uint num, cattrflags attr)
   ReleaseDC(wnd, dc);
 }
 
+#define dont_debug_win_char_width 2
+
 #ifdef debug_win_char_width
 int
 win_char_width(xchar c, cattrflags attr)
 {
 #define win_char_width xwin_char_width
 int win_char_width(xchar, cattrflags);
+  ulong t = mtime();
   int w = win_char_width(c, attr);
   if (c >= 0x80)
-    printf("win_char_width(%04X) -> %d\n", c, w);
+    printf(" [%ld:%ld] win_char_width(%04X) -> %d\n", t, mtime() - t, c, w);
   return w;
 }
 #endif
@@ -3782,10 +4223,20 @@ int win_char_width(xchar, cattrflags);
 int
 win_char_width(xchar c, cattrflags attr)
 {
+  // NOTE: if wintext.c is compiled with optimization (-O1 or higher), 
+  // and win_char_width is called for a non-BMP character (>= 0x10000), 
+  // (unless inhibited by calls to GetCharABCWidths* below)
+  // a mysterious delay occurs, if tracing with timestamps apparently 
+  // *before* invocation of win_char_width (unless printf gets delayed...)
+
   int findex = (attr & FONTFAM_MASK) >> ATTR_FONTFAM_SHIFT;
   if (findex > 10)
     findex = 0;
   struct fontfam * ff = &fontfamilies[findex];
+#ifdef debug_win_char_width
+  if (c > 0xFF)
+    printf("win_char_width(%04X) font %d\n", c, findex);
+#endif
 
 #define measure_width
 
@@ -3817,17 +4268,20 @@ win_char_width(xchar c, cattrflags attr)
   if (c == 0x2001)
     win_char_width(0x5555, attr);
   if (!ok0)
-    printf("width %04X failed (dc %p)\n", c, dc);
+    printf(" wdth %04X failed (dc %p)\n", c, dc);
   else if (c > '~' || c == 'A') {
     int cw = 0;
     BOOL ok1 = GetCharWidth32W(dc, c, c, &cw);  // "not on TrueType"
     float cwf = 0.0;
     BOOL ok2 = GetCharWidthFloatW(dc, c, c, &cwf);
     ABC abc; memset(&abc, 0, sizeof abc);
+    // NOTE: with these 2 calls of GetCharABCWidths*, 
+    // the mysterious delay for non-BMP characters does not occur, 
+    // again mysteriously
     BOOL ok3 = GetCharABCWidthsW(dc, c, c, &abc);  // only on TrueType
     ABCFLOAT abcf; memset(&abcf, 0, sizeof abcf);
     BOOL ok4 = GetCharABCWidthsFloatW(dc, c, c, &abcf);
-    printf("w %04X [cell %d] - 32 %d %d - flt %d %.3f - abc %d %d %d %d - abcflt %d %4.1f %4.1f %4.1f\n", 
+    printf(" w %04X [cell %d] - 32 %d %d - flt %d %.3f - abc %d %d %d %d - abcflt %d %4.1f %4.1f %4.1f\n", 
            c, cell_width, 
            ok1, cw, ok2, cwf, 
            ok3, abc.abcA, abc.abcB, abc.abcC, 
@@ -3836,27 +4290,46 @@ win_char_width(xchar c, cattrflags attr)
 #endif
 
   int ibuf = 0;
-  bool ok = GetCharWidth32W(dc, c, c, &ibuf);
-  if (!ok) {
-    ReleaseDC(wnd, dc);
-    return 0;
-  }
 
-  // report char as wide if its width is more than 1½ cells;
-  // this is unreliable if font fallback is involved (#615)
-  ibuf += cell_width / 2 - 1;
-  ibuf /= cell_width;
-  if (ibuf > 1) {
+#ifdef use_getcharwidth
+#warning avoid buggy GetCharWidth*
+  if (c < 0x10000) {
+    bool ok = GetCharWidth32W(dc, c, c, &ibuf);
 #ifdef debug_win_char_width
-    printf("enquired %04X %dpx cell %dpx\n", c, ibuf, cell_width);
+    printf(" getcharwidth32 %04X %dpx(/cell %dpx)\n", c, ibuf, cell_width);
 #endif
-    ReleaseDC(wnd, dc);
-    return ibuf;
+    if (!ok) {
+      ReleaseDC(wnd, dc);
+      return 0;
+    }
+
+    // report char as wide if its width is more than 1½ cells;
+    // this is unreliable if font fallback is involved (#615)
+    ibuf += cell_width / 2 - 1;
+    ibuf /= cell_width;
+    if (ibuf > 1) {
+#ifdef debug_win_char_width
+      printf(" enquired %04X %dpx/cell %dpx\n", c, ibuf, cell_width);
+#endif
+      ReleaseDC(wnd, dc);
+      //printf(" win_char_width %04X -> %d\n", c, ibuf);
+      return ibuf;
+    }
   }
+#endif
 
 #ifdef measure_width
-  int act_char_width(wchar wc)
+
+#define dont_debug_rendering
+
+  int act_char_width(xchar wc)
   {
+# ifdef debug_rendering
+# include <time.h>
+    struct timespec tim;
+    clock_gettime(CLOCK_MONOTONIC, &tim);
+    ulong now = tim.tv_sec * (long)1000000000 + tim.tv_nsec;
+# endif
     HDC wid_dc = CreateCompatibleDC(dc);
     HBITMAP wid_bm = CreateCompatibleBitmap(dc, cell_width * 2, cell_height);
     HBITMAP wid_oldbm = SelectObject(wid_dc, wid_bm);
@@ -3867,12 +4340,29 @@ win_char_width(xchar c, cattrflags attr)
     SetBkMode(wid_dc, OPAQUE);
     int dx = 0;
     use_uniscribe = cfg.font_render == FR_UNISCRIBE;
-    text_out_start(wid_dc, &wc, 1, &dx);
-    text_out(wid_dc, 0, 0, ETO_OPAQUE, null, &wc, 1, &dx);
+    wchar wc2[2];
+    if (wc < 0x10000) {
+      *wc2 = wc;
+      text_out_start(wid_dc, wc2, 1, &dx);
+      text_out(wid_dc, 0, 0, ETO_OPAQUE, null, wc2, 1, &dx);
+    }
+    else {
+      wc2[0] = high_surrogate(wc);
+      wc2[1] = low_surrogate(wc);
+      text_out_start(wid_dc, wc2, 2, &dx);
+      text_out(wid_dc, 0, 0, ETO_OPAQUE, null, wc2, 2, &dx);
+    }
     text_out_end();
-# ifdef debug_win_char_width
+
+    int wid = 0;
+
+//#define debug_win_char_width 2
+
+#ifdef use_GetPixel
+
+# if defined(debug_win_char_width) && debug_win_char_width > 1
     for (int y = 0; y < cell_height; y++) {
-      printf("%2d|", y);
+      printf(" %2d|", y);
       for (int x = 0; x < cell_width * 2; x++) {
         COLORREF c = GetPixel(wid_dc, x, y);
         printf("%c", c != RGB(0, 0, 0) ? '*' : ' ');
@@ -3880,8 +4370,21 @@ win_char_width(xchar c, cattrflags attr)
       printf("|\n");
     }
 # endif
-
-    int wid = 0;
+# ifdef heuristic_sparse_width_checking
+    for (int x = cell_width * 2 - 1; !wid && x >= cell_width; x -= 2)
+      for (int y = 0; y < cell_height / 2; y++) {
+        COLORREF c = GetPixel(wid_dc, x, cell_height / 2 + y);
+        if (c != RGB(0, 0, 0)) {
+          wid = x + 1;
+          break;
+        }
+        c = GetPixel(wid_dc, x, cell_height / 2 - y);
+        if (c != RGB(0, 0, 0)) {
+          wid = x + 1;
+          break;
+        }
+      }
+# else
     for (int x = cell_width * 2 - 1; !wid && x >= 0; x--)
       for (int y = 0; y < cell_height; y++) {
         COLORREF c = GetPixel(wid_dc, x, y);
@@ -3890,13 +4393,80 @@ win_char_width(xchar c, cattrflags attr)
           break;
         }
       }
+# endif
     SelectObject(wid_dc, wid_oldbm);
+
+#else // use_GetPixel
+
+    SelectObject(wid_dc, wid_oldbm);
+
+# ifdef test_preload_bitmap_info
+    BITMAP bm0;
+    GetObject(wid_bm, sizeof(BITMAP), &bm0);
+    //assuming:
+    //bm0.bmWidthBytes == bm0.bmWidth * 4 == cell_width * 8
+    //bm0.bmBitsPixel == 32
+# endif
+    BITMAPINFO bmi;
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+# ifdef test_precheck_bitmap
+    int ok = GetDIBits(wid_dc, wid_bm, 0, cell_height, 0, &bmi, DIB_RGB_COLORS);
+    printf("DI %d %d pl %d bt/px %d comp %d size %d\n",
+           bmi.bmiHeader.biWidth, bmi.bmiHeader.biHeight,
+           bmi.bmiHeader.biPlanes, bmi.bmiHeader.biBitCount,
+           bmi.bmiHeader.biCompression, bmi.bmiHeader.biSizeImage);
+    //assuming:
+    //bmi.bmiHeader.biBitCount == 32
+    //bmi.bmiHeader.biSizeImage == biWidth * biHeight * 4
+# endif
+    bmi.bmiHeader.biWidth = cell_width * 2;
+    bmi.bmiHeader.biHeight = -cell_height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    DWORD * pixels = newn(DWORD, cell_width * 2 * cell_height);
+    //int scanlines =
+    GetDIBits(wid_dc, wid_bm, 0, cell_height, pixels, &bmi, DIB_RGB_COLORS);
+
+# if defined(debug_win_char_width) && debug_win_char_width > 1
+    for (int y = 0; y < cell_height; y++) {
+      printf(" %2d|", y);
+      for (int x = 0; x < cell_width * 2; x++) {
+        COLORREF c = pixels[y * cell_width * 2 + x];
+        printf("%c", c != RGB(0, 0, 0) ? '*' : ' ');
+      }
+      printf("|\n");
+    }
+# endif
+    for (int x = cell_width * 2 - 1; !wid && x >= 0; x--)
+      for (int y = 0; y < cell_height; y++) {
+        COLORREF c = pixels[y * cell_width * 2 + x];
+        if (c != RGB(0, 0, 0)) {
+          wid = x + 1;
+          break;
+        }
+      }
+
+    free(pixels);
+
+#endif // use_GetPixel
+
     DeleteObject(wid_bm);
     DeleteDC(wid_dc);
+
+# ifdef debug_rendering
+    clock_gettime(CLOCK_MONOTONIC, &tim);
+    ulong then = tim.tv_sec * (long)1000000000 + tim.tv_nsec;
+    printf("rendered %05X %s (t %ld) width %d -> %d\n", wc, attr & TATTR_WIDE ? "wide" : "narr", then - now, wid, wid > cell_width ? 2 : 1);
+# endif
+
     return wid;
   }
 
-  if (c >= 0x2160 && c <= 0x2179) {  // Roman Numerals
+  if ((c >= 0x2160 && c <= 0x2179)   // Roman Numerals
+     )
+  {
     ReleaseDC(wnd, dc);
     return 2;
   }
@@ -3912,22 +4482,31 @@ win_char_width(xchar c, cattrflags attr)
                // although FONT_WIDE is actually activated
   }
 
-  if ((c >= 0x3000 && c <= 0x303F)
-   || (c >= 0x2460 && c <= 0x24FF)   // Enclosed Alphanumerics
-   || (c >= 0x2600 && c <= 0x27BF)   // Miscellaneous Symbols, Dingbats
+  if ((c >= 0x3000 && c <= 0x303F)   // CJK Symbols and Punctuation
+
+   || (c >= 0x01C4 && c <= 0x01CC)   // double letters
+   || (c >= 0x01F1 && c <= 0x01F3)   // double letters
+
+   || (c >= 0x2460 && c <= 0x24FF)   // Enclosed Alphanumerics, to cover:
    //|| (c >= 0x249C && c <= 0x24E9)   // parenthesized/circled letters
-   || (c >= 0x3248 && c <= 0x324F)   // Enclosed CJK Letters and Months
+
+   //|| (c >= 0x2600 && c <= 0x27BF)   // Miscellaneous Symbols, Dingbats
+   || c == 0x26AC
+
+   || (c >= 0x3248 && c <= 0x324F)   // circled CJK Numbers
    || (c >= 0x1F100 && c <= 0x1F1FF) // Enclosed Alphanumeric Supplement
-#ifdef check_more_mostly_covered_below
-   || (c >= 0x2100 && c <= 0x23FF)   // Letterlike, Number Forms, Arrows, Math Operators, Misc Technical
-   || (c >= 0x25A0 && c <= 0x25FF)   // Geometric Shapes
-   || (c >= 0x2B00 && c <= 0x2BFF)   // Miscellaneous Symbols and Arrows
-#endif
+
+   || c == 0x2139                    // Letterlike: Information Source
+   || (c >= 0x2180 && c <= 0x2182)   // Number Forms: combined Roman Numerals
+   || (c >= 0x2187 && c <= 0x2188)   // Number Forms: combined Roman Numerals
+
+   || (c >= 0xE000 && c < 0xF900)    // Private Use Area
+
    || (// check all non-letters with some exceptions
        bidi_class(c) != L               // indicates not a letter
-      &&
+      &&  // do not check these non-letters:
        !(  (c >= 0x2500 && c <= 0x2588)  // Box Drawing, Block Elements
-        || (c >= 0x2592 && c <= 0x2594)  // Block Elements
+        || (c >= 0x2591 && c <= 0x2594)  // Block Elements
         || (c >= 0x2160 && c <= 0x2179)  // Roman Numerals
         //|| wcschr (W("‐‑‘’‚‛“”„‟‹›"), c) // #712 workaround; now caching
         )
@@ -3959,7 +4538,7 @@ win_char_width(xchar c, cattrflags attr)
     ReleaseDC(wnd, dc);
 # ifdef debug_win_char_width
     if (c > '~' || c == 'A') {
-      printf("measured %04X %dpx cell %dpx width %d\n", c, mbuf, cell_width, width);
+      printf(" measured %04X %dpx cell %dpx width %d\n", c, mbuf, cell_width, width);
     }
 # endif
     // cache width
@@ -3976,11 +4555,14 @@ win_char_width(xchar c, cattrflags attr)
         ff->cpcachelen[font4index]++;
       }
     }
+    //printf(" win_char_width %04X -> %d\n", c, width);
     return width;
   }
-#endif
+
+#endif // measure_width
 
   ReleaseDC(wnd, dc);
+  //printf(" win_char_width %04X -> %d\n", c, ibuf);
   return ibuf;
 }
 
@@ -4044,8 +4626,10 @@ win_set_colour(colour_i i, colour c)
     if (i == BOLD_COLOUR_I) {
       cc(BOLD_COLOUR_I, cfg.bold_colour);
     }
-    else
-    if (i == BOLD_FG_COLOUR_I) {
+    else if (i == BLINK_COLOUR_I) {
+      cc(BLINK_COLOUR_I, cfg.blink_colour);
+    }
+    else if (i == BOLD_FG_COLOUR_I) {
       bold_colour_selected = false;
       if (cfg.bold_colour != (colour)-1)
         cc(BOLD_FG_COLOUR_I, cfg.bold_colour);
@@ -4056,12 +4640,22 @@ win_set_colour(colour_i i, colour c)
       cc(i, cfg.fg_colour);
     else if (i == BG_COLOUR_I)
       cc(i, cfg.bg_colour);
-    else if (i == CURSOR_COLOUR_I)
+    else if (i == CURSOR_COLOUR_I) {
       cc(i, cfg.cursor_colour);
+      if (cfg.ime_cursor_colour != DEFAULT_COLOUR)
+        cc(IME_CURSOR_COLOUR_I, cfg.ime_cursor_colour);
+      //printf("ime_cc set -1 %06X\n", cfg.ime_cursor_colour);
+    }
     else if (i == SEL_COLOUR_I)
       cc(i, cfg.sel_bg_colour);
     else if (i == SEL_TEXT_COLOUR_I)
       cc(i, cfg.sel_fg_colour);
+    else if (i == TEK_FG_COLOUR_I)
+      cc(i, cfg.tek_fg_colour);
+    else if (i == TEK_BG_COLOUR_I)
+      cc(i, cfg.tek_bg_colour);
+    else if (i == TEK_CURSOR_COLOUR_I)
+      cc(i, cfg.tek_cursor_colour);
   }
   else {
     cc(i, c);
@@ -4100,8 +4694,30 @@ win_set_colour(colour_i i, colour c)
         // Set the colour of text under the cursor to whichever of foreground
         // and background colour is further away from the cursor colour.
         colour fg = colours[FG_COLOUR_I], bg = colours[BG_COLOUR_I];
-        cc(CURSOR_TEXT_COLOUR_I, colour_dist(c, fg) > colour_dist(c, bg) ? fg : bg);
+        colour _cc = colour_dist(c, fg) > colour_dist(c, bg) ? fg : bg;
+        cc(CURSOR_TEXT_COLOUR_I, _cc);
+        if (cfg.ime_cursor_colour != DEFAULT_COLOUR) {
+          // effective IME cursor colour : configured IME cursor colour
+          // = effective cursor colour : configured cursor colour
+          // resp.
+          // effective IME cursor colour : effective cursor colour
+          // = configured IME cursor colour : configured cursor colour
+          uint r = (uint)red(_cc) * (uint)red(cfg.ime_cursor_colour);
+          if (red(cfg.cursor_colour))
+            r /= red(cfg.cursor_colour);
+          r = max(r, 255);
+          uint g = (uint)green(_cc) * (uint)green(cfg.ime_cursor_colour);
+          if (green(cfg.cursor_colour))
+            g /= green(cfg.cursor_colour);
+          g = max(r, 255);
+          uint b = (uint)blue(_cc) * (uint)blue(cfg.ime_cursor_colour);
+          if (blue(cfg.cursor_colour))
+            b /= blue(cfg.cursor_colour);
+          b = max(r, 255);
+          c = RGB(r, g, b);
+        }
         cc(IME_CURSOR_COLOUR_I, c);
+        //printf("ime_cc set c %06X\n", c);
       }
       otherwise:
         break;
@@ -4119,12 +4735,6 @@ win_get_colour(colour_i i)
   if (term.rvideo && CCL_DEFAULT(i))
     return colours[i ^ 2];  // [BOLD]_FG_COLOUR_I  <-->  [BOLD]_BG_COLOUR_I
   return i < COLOUR_NUM ? colours[i] : 0;
-}
-
-colour
-win_get_sys_colour(bool fg)
-{
-  return GetSysColor(fg ? COLOR_WINDOWTEXT : COLOR_WINDOW);
 }
 
 void
@@ -4154,12 +4764,15 @@ win_reset_colours(void)
   win_set_colour(FG_COLOUR_I, cfg.fg_colour);
   win_set_colour(BG_COLOUR_I, cfg.bg_colour);
   win_set_colour(CURSOR_COLOUR_I, cfg.cursor_colour);
-  if (cfg.ime_cursor_colour != DEFAULT_COLOUR)
+  if (cfg.ime_cursor_colour != DEFAULT_COLOUR) {
     win_set_colour(IME_CURSOR_COLOUR_I, cfg.ime_cursor_colour);
+    //printf("ime_cc reset %06X\n", cfg.ime_cursor_colour);
+  }
   win_set_colour(SEL_COLOUR_I, cfg.sel_bg_colour);
   win_set_colour(SEL_TEXT_COLOUR_I, cfg.sel_fg_colour);
-  // Bold colour
+  // attribute colours
   win_set_colour(BOLD_COLOUR_I, (colour)-1);
+  win_set_colour(BLINK_COLOUR_I, (colour)-1);
 #if defined(debug_bold) || defined(debug_brighten)
   string ci[] = {"FG_COLOUR_I", "BOLD_FG_COLOUR_I", "BG_COLOUR_I", "BOLD_BG_COLOUR_I", "CURSOR_TEXT_COLOUR_I", "CURSOR_COLOUR_I", "IME_CURSOR_COLOUR_I", "SEL_COLOUR_I", "SEL_TEXT_COLOUR_I", "BOLD_COLOUR_I"};
   for (int i = FG_COLOUR_I; i < COLOUR_NUM; i++)
@@ -4168,8 +4781,13 @@ win_reset_colours(void)
     else
       printf("colour %d %06X [%s]\n", i, (int)colours[i], ci[i - FG_COLOUR_I]);
 #endif
+  win_set_colour(TEK_FG_COLOUR_I, cfg.tek_fg_colour);
+  win_set_colour(TEK_BG_COLOUR_I, cfg.tek_bg_colour);
+  win_set_colour(TEK_CURSOR_COLOUR_I, cfg.tek_cursor_colour);
 }
 
+
+#define dont_debug_padding_background
 
 void
 win_paint(void)
@@ -4177,31 +4795,35 @@ win_paint(void)
   PAINTSTRUCT p;
   dc = BeginPaint(wnd, &p);
 
+  // better invalidate more than less; limited to text area in term_invalidate
   term_invalidate(
     (p.rcPaint.left - PADDING) / cell_width,
-    (p.rcPaint.top - PADDING) / cell_height,
+    (p.rcPaint.top - PADDING - OFFSET) / cell_height,
     (p.rcPaint.right - PADDING - 1) / cell_width,
-    (p.rcPaint.bottom - PADDING - 1) / cell_height
+    (p.rcPaint.bottom - PADDING - OFFSET - 1) / cell_height
   );
 
   //if (kb_trace) printf("[%ld] win_paint state %d (idl/blk/pnd)\n", mtime(), update_state);
   if (update_state != UPDATE_PENDING) {
-    term_paint();
-    winimg_paint();
+    if (tek_mode)
+      tek_paint();
+    else {
+      term_paint();
+      winimgs_paint();
+    }
   }
 
-  if (// do not just check whether a background was configured
-      //!*cfg.background &&
-      // check whether a configured background was successfully loaded
+  if (// check whether no background was configured and successfully loaded
       !bgbrush_bmp &&
 #if CYGWIN_VERSION_API_MINOR >= 74
       !bgbrush_img &&
 #endif
+      // check whether we need to refresh padding background
       (p.fErase
        || p.rcPaint.left < PADDING
-       || p.rcPaint.top < PADDING
+       || p.rcPaint.top < OFFSET + PADDING
        || p.rcPaint.right >= PADDING + cell_width * term.cols
-       || p.rcPaint.bottom >= PADDING + cell_height * term.rows
+       || p.rcPaint.bottom >= OFFSET + PADDING + cell_height * term.rows
       )
      )
   {
@@ -4216,21 +4838,34 @@ win_paint(void)
          but not modify the established behaviour if there is no background.
      */
     colour bg_colour = colours[term.rvideo ? FG_COLOUR_I : BG_COLOUR_I];
+#ifdef debug_padding_background
+    // visualize background for testing
+    bg_colour = RGB(222, 0, 0);
+#endif
     HBRUSH oldbrush = SelectObject(dc, CreateSolidBrush(bg_colour));
     HPEN oldpen = SelectObject(dc, CreatePen(PS_SOLID, 0, bg_colour));
 
-    IntersectClipRect(dc, p.rcPaint.left, p.rcPaint.top, p.rcPaint.right,
-                      p.rcPaint.bottom);
+    // unclear purpose
+    IntersectClipRect(dc, p.rcPaint.left, p.rcPaint.top,
+                          p.rcPaint.right, p.rcPaint.bottom);
 
-    ExcludeClipRect(dc, PADDING, PADDING,
-                    PADDING + cell_width * term.cols,
-                    PADDING + cell_height * term.rows);
+    // mask inner area not to pad with background
+    ExcludeClipRect(dc, PADDING,
+                        OFFSET + PADDING,
+                        PADDING + cell_width * term.cols,
+                        OFFSET + PADDING + cell_height * term.rows);
 
-    Rectangle(dc, p.rcPaint.left, p.rcPaint.top,
-                  p.rcPaint.right, p.rcPaint.bottom);
+    // fill outer padding area with background
+    int sy = win_search_visible() ? SEARCHBAR_HEIGHT : 0;
+    Rectangle(dc, p.rcPaint.left, max(p.rcPaint.top, OFFSET),
+                  p.rcPaint.right, p.rcPaint.bottom - sy);
 
     DeleteObject(SelectObject(dc, oldbrush));
     DeleteObject(SelectObject(dc, oldpen));
+#ifdef debug_padding_background
+    // show visualized background for testing
+    usleep(900000);
+#endif
   }
 
   EndPaint(wnd, &p);

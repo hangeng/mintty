@@ -18,7 +18,8 @@
 # - DMALLOC: define to enable the dmalloc heap debugging library
 #
 # The values of DEBUG and DMALLOC variables do not matter, it's just about
-# whether they're defined, so e.g. 'make DEBUG=1' will trigger a debug build.
+# whether they're defined; a debug build can be built with
+#	make DEBUG=1
 
 #############################################################################
 NAME := mintty
@@ -115,7 +116,8 @@ LDLIBS := -mwindows $(extralibs) -lcomctl32 -limm32 -lwinmm -lwinspool -lole32 -
 #override LDLIBS += -mwindows $(extralibs) -lcomctl32 -limm32 -lwinmm -lwinspool -lole32 -luuid
 
 ifdef DEBUG
-  CFLAGS += -g
+#  CPPFLAGS += -Wno-trampolines
+  CFLAGS += -g -Wno-error
 else
   CPPFLAGS += -DNDEBUG
   CFLAGS += -fomit-frame-pointer -O2
@@ -141,13 +143,23 @@ CCOPT=
 CCFLAGS:=$(CFLAGS) $(CCOPT)
 
 $(BINDIR)/term%.o: term%.c
-	$(CC) -c $(DEPOPT) $(CPPFLAGS) $(CCFLAGS) $< -o $(BINDIR)/term$*.o
+	$(CC) -c $(DEPOPT) $(CCFLAGS) $(CPPFLAGS) $< -o $(BINDIR)/term$*.o
+
+$(BINDIR)/term.o: term.c emojibase.t emojiseqs.t
+	$(CC) -c $(DEPOPT) $(CCFLAGS) $(CPPFLAGS) -fstack-check $< -o $(BINDIR)/term.o
+
+# do not optimize wintext.c; this causes a mysterious delay if 
+# win_char_width is called with a non-BMP character
+$(BINDIR)/wintext.o: wintext.c
+	$(CC) -c $(DEPOPT) $(CCFLAGS) -O0 $(CPPFLAGS) -fstack-check $< -o $(BINDIR)/wintext.o
 
 $(BINDIR)/%.o: %.c
-	$(CC) -c $(DEPOPT) $(CPPFLAGS) $(CCFLAGS) -fstack-check $< -o $(BINDIR)/$*.o
+	$(CC) -c $(DEPOPT) $(CCFLAGS) $(CPPFLAGS) -fstack-check $< -o $(BINDIR)/$*.o
 
 $(BINDIR)/%.o: %.rc %.h %.mft
-	$(RC) -c 65001 --preprocessor '$(CC) -E -xc -DRC_INVOKED $(DEPOPT) $(CPPFLAGS)' $< $(BINDIR)/$*.o
+	#$(RC) -c 65001 --preprocessor '$(CC) -E -xc -DRC_INVOKED $(DEPOPT) $(CPPFLAGS)' $< $(BINDIR)/$*.o
+	# broken in binutils 2.36; workaround:
+	$(CC) -E -xc -DRC_INVOKED $(DEPOPT) $(CPPFLAGS) $< | $(RC) -c 65001 -o $(BINDIR)/$*.o
 	-mv $*.d $(BINDIR)/
 
 exe := $(NAME).exe
@@ -185,10 +197,10 @@ rgb.t:	# /usr/share/X11/rgb.txt # X11 color names, from package 'rgb'
 	sed -e 's,	, ,g' -e 's/ *\([0-9][0-9]*\) *\([0-9][0-9]*\) *\([0-9][0-9]*\) *\([^ ].*[^ ]\) */	{\1, \2, \3, "\4"},/' /usr/share/X11/rgb.txt > rgb.t
 
 combdata=combining.t combdouble.t combined.t
-unidata=$(combdata) ambiguous.t casefold.t bidiclasses.t mirroring.t brackets.t canonical.t wide.t unicodever.t
+unidata=$(combdata) ambiguous.t scripts.t blocks.t casefold.t bidiclasses.t mirroring.t brackets.t canonical.t wide.t unicodever.t
 emojidata=emojibase.t emojiseqs.t
 
-unicodedata=UnicodeData.txt EastAsianWidth.txt Blocks.txt CaseFolding.txt BidiMirroring.txt BidiBrackets.txt BidiCharacterTest.txt BidiTest.txt NameAliases.txt
+unicodedata=UnicodeData.txt EastAsianWidth.txt Blocks.txt Scripts.txt CaseFolding.txt BidiMirroring.txt BidiBrackets.txt BidiCharacterTest.txt BidiTest.txt NameAliases.txt
 unicodeemoji=emoji-data.txt emoji-sequences.txt emoji-variation-sequences.txt emoji-zwj-sequences.txt
 
 clean-unicode:
@@ -215,6 +227,12 @@ WIDTH-A:	# UnicodeData.txt Blocks.txt EastAsianWidth.txt
 wide.t:	# UnicodeData.txt Blocks.txt EastAsianWidth.txt
 	sh ./mkwide
 
+scripts.t:	# Scripts.txt
+	sh ./mkscripts
+
+blocks.t:	# Blocks.txt
+	sh ./mkblocks
+
 casefold.t:	# CaseFolding.txt
 	sh ./mkcasefold > casefold.t
 
@@ -238,14 +256,28 @@ testbidi.exe:	testbidi.tc minibidi.c # BidiCharacterTest.txt BidiTest.txt
 
 unicode:	UnicodeData.txt Blocks.txt EastAsianWidth.txt
 
-full-emoji-list.html:
-	$(WGET) http://www.unicode.org/emoji/charts/$@
+#full-emoji-list.html:
+#	$(WGET) http://www.unicode.org/emoji/charts/$@
 
-univer = `sed -e '/^\# Blocks-/ s,[^0-9]*\([0-9]*\)\.\([0-9]\)\.[0-9][^0-9]*,\1.\2,' -e t -e d Blocks.txt`
+univer = `sed -e '/^\# Blocks-/ s,[^0-9]*\([0-9]*\)\.\([0-9]\)\.\([0-9]\)[^0-9]*,\1.\2.\3,' -e t -e d Blocks.txt`
 unibasever = `sed -e '/^\# Blocks-/ s,[^0-9]*\([0-9]*\)\..*,\1.0,' -e t -e d Blocks.txt`
 
-emoji-%.txt:	Blocks.txt
-	$(WGET) http://www.unicode.org/Public/emoji/$(unibasever)/$@
+# Emoji version may advance Unicode version
+emojiver = $(unibasever)
+emojiver = 13.1
+
+# until 12.0:
+#emoji-%.txt:	Blocks.txt
+#	$(WGET) http://www.unicode.org/Public/emoji/$(unibasever)/$@
+# from 13.0:
+emoji-sequences.txt:	Blocks.txt
+	$(WGET) http://www.unicode.org/Public/emoji/$(emojiver)/$@
+emoji-zwj-sequences.txt:	Blocks.txt
+	$(WGET) http://www.unicode.org/Public/emoji/$(emojiver)/$@
+emoji-data.txt:	Blocks.txt
+	$(WGET) http://www.unicode.org/Public/$(univer)/ucd/emoji/$@
+emoji-variation-sequences.txt:	Blocks.txt
+	$(WGET) http://www.unicode.org/Public/$(univer)/ucd/emoji/$@
 
 unicodever = `sed -e '/^\# Blocks-/ s,[^0-9]*\([0-9]*\)\.\([0-9]\)\.\([0-9]\)[^0-9]*,\1\2\3,' -e t -e d Blocks.txt`
 
@@ -316,7 +348,7 @@ $(pdf): ../docs/$(NAME).1
 html := ../docs/$(NAME).1.html
 html: $(html)
 $(html): ../docs/$(NAME).1
-	groff -t -man -Thtml $< > $@
+	sed -f html.sed $< | groff -t -man -mwww -Thtml > $@
 
 clean:
 	#rm -rf *.d *.o $(NAME)*
@@ -341,7 +373,8 @@ SRCDEBUG+= -e "\((true|1) *\|"
 SRCDEBUG+= -e "& 0($|[^bx])"
 SRCDEBUG+= -e "^///"
 checksrc:
-	if egrep -a $(SRCDEBUG) *.[hc]; then false; fi
+	if egrep -an $(SRCDEBUG) *.[hc]; then false; fi
+	if sed -e "s,.*IDM_.*0x\([0-9A-F]*\) *,\1," -e t -e d winids.h | sort | uniq -d | grep .; then false; fi
 
 #############################################################################
 # development and debug targets

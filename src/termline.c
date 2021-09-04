@@ -251,12 +251,13 @@ makeliteral_attr(struct buf *b, termchar *c)
   */
   cattrflags attr = c->attr.attr & ~DATTR_MASK;
   int link = c->attr.link;
-  uint truefg = c->attr.truefg;
-  uint truebg = c->attr.truebg;
+  int imgi = c->attr.imgi;
+  colour truefg = c->attr.truefg;
+  colour truebg = c->attr.truebg;
   colour ulcolr = c->attr.ulcolr;
 
   if (attr < 0x800000 && !truefg && !truebg
-      && link == -1 && ulcolr == (colour)-1) {
+      && link == -1 && !imgi && ulcolr == (colour)-1) {
     add(b, (uchar) ((attr >> 16) & 0xFF));
     add(b, (uchar) ((attr >> 8) & 0xFF));
     add(b, (uchar) (attr & 0xFF));
@@ -274,6 +275,10 @@ makeliteral_attr(struct buf *b, termchar *c)
     add(b, (uchar) ((link >> 16) & 0xFF));
     add(b, (uchar) ((link >> 8) & 0xFF));
     add(b, (uchar) (link & 0xFF));
+    add(b, (uchar) ((imgi >> 24) & 0xFF));
+    add(b, (uchar) ((imgi >> 16) & 0xFF));
+    add(b, (uchar) ((imgi >> 8) & 0xFF));
+    add(b, (uchar) (imgi & 0xFF));
 
     add(b, (uchar) ((truefg >> 16) & 0xFF));
     add(b, (uchar) ((truefg >> 8) & 0xFF));
@@ -332,6 +337,7 @@ readliteral_attr(struct buf *b, termchar *c, termline *unused(line))
 {
   cattrflags attr;
   int link = -1;
+  int imgi = 0;
   uint fg = 0;
   uint bg = 0;
   colour ul = (colour)-1;
@@ -355,6 +361,10 @@ readliteral_attr(struct buf *b, termchar *c, termline *unused(line))
     link |= get(b) << 16;
     link |= get(b) << 8;
     link |= get(b);
+    imgi = get(b) << 24;
+    imgi |= get(b) << 16;
+    imgi |= get(b) << 8;
+    imgi |= get(b);
 
     fg = get(b) << 16;
     fg |= get(b) << 8;
@@ -369,6 +379,7 @@ readliteral_attr(struct buf *b, termchar *c, termline *unused(line))
 
   c->attr.attr = attr;
   c->attr.link = link;
+  c->attr.imgi = imgi;
   c->attr.truefg = fg;
   c->attr.truebg = bg;
   c->attr.ulcolr = ul;
@@ -909,6 +920,24 @@ term_bidi_cache_store(int line,
       p++;
       term.post_bidi_cache[line].backward[i] = p;
       term.post_bidi_cache[line].forward[p] = i;
+#ifdef support_triple_width
+# ifdef support_quadruple_width
+      int wide = wcTo[ib].wide;
+      while (wide > 1 && i + 1 < width) {
+        i++;
+        p++;
+        term.post_bidi_cache[line].backward[i] = p;
+        term.post_bidi_cache[line].forward[p] = i;
+      }
+# else
+      if (wcTo[ib].wide > 1 && i + 1 < width) {
+        i++;
+        p++;
+        term.post_bidi_cache[line].backward[i] = p;
+        term.post_bidi_cache[line].forward[p] = i;
+      }
+# endif
+#endif
     }
 
     ib++;
@@ -1106,13 +1135,11 @@ term_bidi_line(termline *line, int scr_y)
      )
     return null;
 
-  termchar *lchars;
-  int it, ib;
-
  /* Do Arabic shaping and bidi. */
 
-  if (!term_bidi_cache_hit(scr_y, line->chars, line->lattr, term.cols)) {
-
+  if (term_bidi_cache_hit(scr_y, line->chars, line->lattr, term.cols))
+    return term.post_bidi_cache[scr_y].chars;
+  else {
     if (term.wcFromTo_size < term.cols) {
       term.wcFromTo_size = term.cols;
       term.wcFrom = renewn(term.wcFrom, term.wcFromTo_size);
@@ -1123,11 +1150,11 @@ term_bidi_line(termline *line, int scr_y)
     //wchar wcs[2 * term.cols];  /// size handling to be tweaked
     //int wcsi = 0;
 
-    ib = 0;
+    int ib = 0;
 #ifdef apply_HL3
     uint emojirest = 0;
 #endif
-    for (it = 0; it < term.cols; it++) {
+    for (int it = 0; it < term.cols; it++) {
       ucschar c = line->chars[it].chr;
       //wcs[wcsi++] = c;
 
@@ -1200,7 +1227,22 @@ term_bidi_line(termline *line, int scr_y)
       }
       else if (ib) {
         // skip wide character virtual right half, flag it
+#ifdef support_triple_width
+# ifdef support_quadruple_width
+        if (it + 1 < term.cols && line->chars[it + 1].chr == UCSWIDE) {
+          term.wcFrom[ib - 1].wide = 1;
+          for (int i = it + 1; i < term.cols && line->chars[i].chr == UCSWIDE; i++)
+          term.wcFrom[ib - 1].wide ++;
+        }
+# else
+        if (it + 1 < term.cols && line->chars[it + 1].chr == UCSWIDE)
+          term.wcFrom[ib - 1].wide = 2;
+# endif
+        else if (!term.wcFrom[ib - 1].wide)
+          term.wcFrom[ib - 1].wide = true;
+#else
         term.wcFrom[ib - 1].wide = true;
+#endif
       }
 
 #ifdef apply_HL3
@@ -1322,7 +1364,7 @@ term_bidi_line(termline *line, int scr_y)
 
     // equip ltemp with reorder line->chars as determined in wcTo
     ib = 0;
-    for (it = 0; it < term.cols; it++) {
+    for (int it = 0; it < term.cols; it++) {
       while (term.wcTo[ib].index == -1)
         ib++;
 
@@ -1339,6 +1381,20 @@ term_bidi_line(termline *line, int scr_y)
       // expand wide characters to their double-half representation
       if (term.wcTo[ib].wide && it + 1 < term.cols && term.wcTo[ib].index + 1 < term.cols) {
         term.ltemp[++it] = line->chars[term.wcTo[ib].index + 1];
+#ifdef support_triple_width
+# ifdef support_quadruple_width
+        if (term.wcTo[ib].wide > 1 && it + 1 < term.cols) {
+          int wide = term.wcTo[ib].wide;
+          while (wide > 1 && it + 1 < term.cols) {
+            term.ltemp[++it] = line->chars[term.wcTo[ib].index + 1];
+            wide --;
+          }
+        }
+# else
+        if (term.wcTo[ib].wide > 1 && it + 1 < term.cols)
+          term.ltemp[++it] = line->chars[term.wcTo[ib].index + 1];
+# endif
+#endif
       }
 
       ib++;
@@ -1360,11 +1416,6 @@ term_bidi_line(termline *line, int scr_y)
     printf("\n");
 #endif
 
-    lchars = term.ltemp;
+    return term.ltemp;
   }
-  else {
-    lchars = term.post_bidi_cache[scr_y].chars;
-  }
-
-  return lchars;
 }
