@@ -1,12 +1,12 @@
 // config.c (part of mintty)
-// Copyright 2008-13 Andy Koppe, 2015-2021 Thomas Wolff
+// Copyright 2008-2022 Andy Koppe, 2015-2022 Thomas Wolff
 // Based on code from PuTTY-0.60 by Simon Tatham and team.
 // Licensed under the terms of the GNU General Public License v3 or later.
 
 // Internationalization approach:
 // instead of refactoring a lot of framework functions (here, *ctrls.c)
 // to use Unicode strings, the API is simply redefined to use UTF-8;
-// non-ASCII strings are converted before being passed to the platform 
+// non-ASCII strings are converted before being passed to the platform
 // (using UTF-16 on Windows)
 
 #include "term.h"
@@ -81,6 +81,7 @@ const config default_cfg = {
   .fontfams[8] = {.name = W(""), .weight = 400, .isbold = false},
   .fontfams[9] = {.name = W(""), .weight = 400, .isbold = false},
   .fontfams[10] = {.name = W(""), .weight = 400, .isbold = false},
+  .fontfams[11] = {.name = W("Courier New"), .weight = 400, .isbold = false},
   .font_choice = W(""),
   .font_sample = W(""),
   .show_hidden_fonts = false,
@@ -123,11 +124,14 @@ const config default_cfg = {
   .key_scrlock = "",	// VK_SCROLL
   .key_commands = W(""),
   .manage_leds = 7,
+  .enable_remap_ctrls = false,
+  .old_keyfuncs_keypad = false,
   // Mouse
   .clicks_place_cursor = false,
   .middle_click_action = MC_PASTE,
   .right_click_action = RC_MENU,
   .opening_clicks = 1,
+  .opening_mod = MDK_CTRL,
   .zoom_mouse = true,
   .clicks_target_app = true,
   .click_target_mod = MDK_SHIFT,
@@ -150,8 +154,10 @@ const config default_cfg = {
   // Window
   .cols = 80,
   .rows = 24,
+  .rewrap_on_resize = false,
   .scrollbar = 1,
   .scrollback_lines = 10000,
+  .max_scrollback_lines = 250000,
   .scroll_mod = MDK_SHIFT,
   .pgupdn_scroll = false,
   .lang = W(""),
@@ -160,6 +166,7 @@ const config default_cfg = {
   // Terminal
   .term = "xterm",
   .answerback = W(""),
+  .wrap_tab = 0,
   .old_wrapmodes = false,
   .enable_deccolm_init = false,
   .bell_type = 1,
@@ -171,6 +178,7 @@ const config default_cfg = {
   .bell_taskbar = true, // xterm: bellIsUrgent
   .bell_popup = false,  // xterm: popOnBell
   .bell_interval = 100,
+  .play_tone = 2,
   .printer = W(""),
   .confirm_exit = true,
   // Command line
@@ -197,12 +205,12 @@ const config default_cfg = {
   .suppress_nrc = "",  // unused
   .suppress_wheel = "",
   .filter_paste = "",
-  .bracketed_paste_split = 1,
+  .bracketed_paste_split = 0,
   .suspbuf_max = 8080,
   .printable_controls = 0,
   .char_narrowing = 75,
   .emojis = 0,
-  .emoji_placement = 0,
+  .emoji_placement = EMPL_STRETCH,
   .save_filename = W("mintty.%Y-%m-%d_%H-%M-%S"),
   .app_id = W(""),
   .app_name = W(""),
@@ -226,6 +234,7 @@ const config default_cfg = {
   .menu_title_ctrl_r = "Ws",
   .geom_sync = 0,
   .tabbar = 0,
+  .new_tabs = 0,
   .col_spacing = 0,
   .row_spacing = 0,
   .auto_leading = 2,
@@ -241,9 +250,13 @@ const config default_cfg = {
   .bold_as_special = false,
   .hover_title = true,
   .progress_bar = 0,
+  .progress_scan = 1,
+  .dim_margins = false,
+  .status_line = false,
   .old_bold = false,
   .ime_cursor_colour = DEFAULT_COLOUR,
   .ansi_colours = {
+#ifdef old_mintty_colour_scheme  // theme "mintty"
     [BLACK_I]        = RGB(0x00, 0x00, 0x00),
     [RED_I]          = RGB(0xBF, 0x00, 0x00),
     [GREEN_I]        = RGB(0x00, 0xBF, 0x00),
@@ -260,6 +273,24 @@ const config default_cfg = {
     [BOLD_MAGENTA_I] = RGB(0xFF, 0x40, 0xFF),
     [BOLD_CYAN_I]    = RGB(0x40, 0xFF, 0xFF),
     [BOLD_WHITE_I]   = RGB(0xFF, 0xFF, 0xFF)
+#else  // theme "helmholtz"
+    [BLACK_I]        = { RGB(  0,   0,   0), RGB(  0,   0,   0) },
+    [RED_I]          = { RGB(212,  44,  58), RGB(162,  30,  41) },
+    [GREEN_I]        = { RGB( 28, 168,   0), RGB( 28, 168,   0) },
+    [YELLOW_I]       = { RGB(192, 160,   0), RGB(192, 160,   0) },
+    [BLUE_I]         = { RGB(  0,  93, 255), RGB(  0,  32, 192) },
+    [MAGENTA_I]      = { RGB(177,  72, 198), RGB(134,  54, 150) },
+    [CYAN_I]         = { RGB(  0, 168, 154), RGB(  0, 168, 154) },
+    [WHITE_I]        = { RGB(191, 191, 191), RGB(191, 191, 191) },
+    [BOLD_BLACK_I]   = { RGB( 96,  96,  96), RGB( 72,  72,  72) },
+    [BOLD_RED_I]     = { RGB(255, 118, 118), RGB(255, 118, 118) },
+    [BOLD_GREEN_I]   = { RGB(  0, 242,   0), RGB(  0, 242,   0) },
+    [BOLD_YELLOW_I]  = { RGB(242, 242,   0), RGB(242, 242,   0) },
+    [BOLD_BLUE_I]    = { RGB(125, 151, 255), RGB(125, 151, 255) },
+    [BOLD_MAGENTA_I] = { RGB(255, 112, 255), RGB(255, 112, 255) },
+    [BOLD_CYAN_I]    = { RGB(  0, 240, 240), RGB(  0, 240, 240) },
+    [BOLD_WHITE_I]   = { RGB(255, 255, 255), RGB(255, 255, 255) }
+#endif
   },
   .sixel_clip_char = W(" "),
   .baud = 0,
@@ -275,7 +306,7 @@ config cfg, new_cfg, file_cfg;
 typedef enum {
   OPT_BOOL, OPT_MOD, OPT_TRANS, OPT_CURSOR, OPT_FONTSMOOTH, OPT_FONTRENDER,
   OPT_MIDDLECLICK, OPT_RIGHTCLICK, OPT_SCROLLBAR, OPT_WINDOW, OPT_HOLD,
-  OPT_INT, OPT_COLOUR, OPT_STRING, OPT_WSTRING,
+  OPT_INT, OPT_COLOUR, OPT_COLOUR_PAIR, OPT_STRING, OPT_WSTRING,
   OPT_CHARWIDTH, OPT_EMOJIS, OPT_EMOJI_PLACEMENT,
   OPT_COMPOSE_KEY,
   OPT_TYPE_MASK = 0x1F,
@@ -372,6 +403,8 @@ options[] = {
   {"Font9Weight", OPT_INT, offcfg(fontfams[9].weight)},
   {"Font10", OPT_WSTRING, offcfg(fontfams[10].name)},
   {"Font10Weight", OPT_INT, offcfg(fontfams[10].weight)},
+  {"FontRTL", OPT_WSTRING, offcfg(fontfams[11].name)},
+  {"FontRTLWeight", OPT_INT, offcfg(fontfams[11].weight)},
   {"TekFont", OPT_WSTRING, offcfg(tek_font)},
 
   // Keys
@@ -404,12 +437,15 @@ options[] = {
   {"Pause", OPT_STRING | OPT_LEGACY, offcfg(key_pause)},
   {"KeyFunctions", OPT_WSTRING | OPT_KEEPCR, offcfg(key_commands)},
   {"ManageLEDs", OPT_INT, offcfg(manage_leds)},
+  {"ShootFoot", OPT_BOOL, offcfg(enable_remap_ctrls)},
+  {"OldKeyFunctionsKeypad", OPT_BOOL, offcfg(old_keyfuncs_keypad)},
 
   // Mouse
   {"ClicksPlaceCursor", OPT_BOOL, offcfg(clicks_place_cursor)},
   {"MiddleClickAction", OPT_MIDDLECLICK, offcfg(middle_click_action)},
   {"RightClickAction", OPT_RIGHTCLICK, offcfg(right_click_action)},
   {"OpeningClicks", OPT_INT, offcfg(opening_clicks)},
+  {"OpeningMod", OPT_MOD, offcfg(opening_mod)},
   {"ZoomMouse", OPT_BOOL, offcfg(zoom_mouse)},
   {"ClicksTargetApp", OPT_BOOL, offcfg(clicks_target_app)},
   {"ClickTargetMod", OPT_MOD, offcfg(click_target_mod)},
@@ -435,7 +471,9 @@ options[] = {
   // Window
   {"Columns", OPT_INT, offcfg(cols)},
   {"Rows", OPT_INT, offcfg(rows)},
+  {"RewrapOnResize", OPT_BOOL, offcfg(rewrap_on_resize)},
   {"ScrollbackLines", OPT_INT, offcfg(scrollback_lines)},
+  {"MaxScrollbackLines", OPT_INT, offcfg(max_scrollback_lines)},
   {"Scrollbar", OPT_SCROLLBAR, offcfg(scrollbar)},
   {"ScrollMod", OPT_MOD, offcfg(scroll_mod)},
   {"PgUpDnScroll", OPT_BOOL, offcfg(pgupdn_scroll)},
@@ -446,6 +484,7 @@ options[] = {
   // Terminal
   {"Term", OPT_STRING, offcfg(term)},
   {"Answerback", OPT_WSTRING, offcfg(answerback)},
+  {"WrapTab", OPT_INT, offcfg(wrap_tab)},
   {"OldWrapModes", OPT_BOOL, offcfg(old_wrapmodes)},
   {"Enable132ColumnSwitching", OPT_BOOL, offcfg(enable_deccolm_init)},
   {"BellType", OPT_INT, offcfg(bell_type)},
@@ -463,6 +502,7 @@ options[] = {
   {"BellTaskbar", OPT_BOOL, offcfg(bell_taskbar)},
   {"BellPopup", OPT_BOOL, offcfg(bell_popup)},
   {"BellInterval", OPT_INT, offcfg(bell_interval)},
+  {"PlayTone", OPT_INT, offcfg(play_tone)},
   {"Printer", OPT_WSTRING, offcfg(printer)},
   {"ConfirmExit", OPT_BOOL, offcfg(confirm_exit)},
 
@@ -525,6 +565,7 @@ options[] = {
 
   {"SessionGeomSync", OPT_INT, offcfg(geom_sync)},
   {"TabBar", OPT_BOOL, offcfg(tabbar)},
+  {"NewTabs", OPT_INT, offcfg(new_tabs)},
   {"ColSpacing", OPT_INT, offcfg(col_spacing)},
   {"RowSpacing", OPT_INT, offcfg(row_spacing)},
   {"AutoLeading", OPT_INT, offcfg(auto_leading)},
@@ -542,8 +583,11 @@ options[] = {
   {"BoldAsRainbowSparkles", OPT_BOOL, offcfg(bold_as_special)},
   {"HoverTitle", OPT_BOOL, offcfg(hover_title)},
   {"ProgressBar", OPT_BOOL, offcfg(progress_bar)},
+  {"ProgressScan", OPT_INT, offcfg(progress_scan)},
   {"Baud", OPT_INT, offcfg(baud)},
   {"Bloom", OPT_INT, offcfg(bloom)},
+  {"DimMargins", OPT_BOOL, offcfg(dim_margins)},
+  {"StatusLine", OPT_BOOL, offcfg(status_line)},
   {"OldXButtons", OPT_BOOL, offcfg(old_xbuttons)},
   {"OptionsFont", OPT_WSTRING, offcfg(options_font)},
   {"OptionsFontSize", OPT_INT | OPT_LEGACY, offcfg(options_fontsize)},
@@ -551,22 +595,22 @@ options[] = {
   {"OldOptions", OPT_STRING, offcfg(old_options)},
 
   // ANSI colours
-  {"Black", OPT_COLOUR, offcfg(ansi_colours[BLACK_I])},
-  {"Red", OPT_COLOUR, offcfg(ansi_colours[RED_I])},
-  {"Green", OPT_COLOUR, offcfg(ansi_colours[GREEN_I])},
-  {"Yellow", OPT_COLOUR, offcfg(ansi_colours[YELLOW_I])},
-  {"Blue", OPT_COLOUR, offcfg(ansi_colours[BLUE_I])},
-  {"Magenta", OPT_COLOUR, offcfg(ansi_colours[MAGENTA_I])},
-  {"Cyan", OPT_COLOUR, offcfg(ansi_colours[CYAN_I])},
-  {"White", OPT_COLOUR, offcfg(ansi_colours[WHITE_I])},
-  {"BoldBlack", OPT_COLOUR, offcfg(ansi_colours[BOLD_BLACK_I])},
-  {"BoldRed", OPT_COLOUR, offcfg(ansi_colours[BOLD_RED_I])},
-  {"BoldGreen", OPT_COLOUR, offcfg(ansi_colours[BOLD_GREEN_I])},
-  {"BoldYellow", OPT_COLOUR, offcfg(ansi_colours[BOLD_YELLOW_I])},
-  {"BoldBlue", OPT_COLOUR, offcfg(ansi_colours[BOLD_BLUE_I])},
-  {"BoldMagenta", OPT_COLOUR, offcfg(ansi_colours[BOLD_MAGENTA_I])},
-  {"BoldCyan", OPT_COLOUR, offcfg(ansi_colours[BOLD_CYAN_I])},
-  {"BoldWhite", OPT_COLOUR, offcfg(ansi_colours[BOLD_WHITE_I])},
+  {"Black", OPT_COLOUR_PAIR, offcfg(ansi_colours[BLACK_I])},
+  {"Red", OPT_COLOUR_PAIR, offcfg(ansi_colours[RED_I])},
+  {"Green", OPT_COLOUR_PAIR, offcfg(ansi_colours[GREEN_I])},
+  {"Yellow", OPT_COLOUR_PAIR, offcfg(ansi_colours[YELLOW_I])},
+  {"Blue", OPT_COLOUR_PAIR, offcfg(ansi_colours[BLUE_I])},
+  {"Magenta", OPT_COLOUR_PAIR, offcfg(ansi_colours[MAGENTA_I])},
+  {"Cyan", OPT_COLOUR_PAIR, offcfg(ansi_colours[CYAN_I])},
+  {"White", OPT_COLOUR_PAIR, offcfg(ansi_colours[WHITE_I])},
+  {"BoldBlack", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_BLACK_I])},
+  {"BoldRed", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_RED_I])},
+  {"BoldGreen", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_GREEN_I])},
+  {"BoldYellow", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_YELLOW_I])},
+  {"BoldBlue", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_BLUE_I])},
+  {"BoldMagenta", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_MAGENTA_I])},
+  {"BoldCyan", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_CYAN_I])},
+  {"BoldWhite", OPT_COLOUR_PAIR, offcfg(ansi_colours[BOLD_WHITE_I])},
 
   // Legacy
   {"BoldAsBright", OPT_BOOL | OPT_LEGACY, offcfg(bold_as_colour)},
@@ -580,12 +624,18 @@ typedef const struct {
 
 static opt_val * const opt_vals[] = {
   [OPT_BOOL] = (opt_val[]) {
-    {"no", false},
-    {"yes", true},
-    {"false", false},
-    {"true", true},
-    {"off", false},
-    {"on", true},
+    //__ Setting false for Boolean options (localization optional)
+    {__("no"), false},
+    //__ Setting true for Boolean options (localization optional)
+    {__("yes"), true},
+    //__ Setting false for Boolean options (localization optional)
+    {__("false"), false},
+    //__ Setting true for Boolean options (localization optional)
+    {__("true"), true},
+    //__ Setting false for Boolean options (localization optional)
+    {__("off"), false},
+    //__ Setting true for Boolean options (localization optional)
+    {__("on"), true},
     {0, 0}
   },
   [OPT_CHARWIDTH] = (opt_val[]) {
@@ -613,13 +663,13 @@ static opt_val * const opt_vals[] = {
     {0, 0}
   },
   [OPT_EMOJI_PLACEMENT] = (opt_val[]) {
-    //__ Options - Text - Emojis - Placement
+    //__ Options - Text - Emojis - Placement (localization optional)
     {__("stretch"), EMPL_STRETCH},
-    //__ Options - Text - Emojis - Placement
+    //__ Options - Text - Emojis - Placement (localization optional)
     {__("align"), EMPL_ALIGN},
-    //__ Options - Text - Emojis - Placement
+    //__ Options - Text - Emojis - Placement (localization optional)
     {__("middle"), EMPL_MIDDLE},
-    //__ Options - Text - Emojis - Placement
+    //__ Options - Text - Emojis - Placement (localization optional)
     {__("full"), EMPL_FULL},
     {0, 0}
   },
@@ -903,30 +953,30 @@ parse_colour(string s, colour *cp)
     ;
   else if (sscanf(s, "rgb:%4x/%4x/%4x", &r, &g, &b) == 3)
     r >>= 8, g >>= 8, b >>= 8;
-  else if (sscanf(s, "cmy:%f/%f/%f", &c, &m, &y) == 3
-        || sscanf(s, "cmyk:%f/%f/%f/%f", &c, &m, &y, &k) == 4
-          )
-    if (c >= 0 && c <= 1 && m >= 0 && m <= 1 && y >= 0 && y <= 1 && k >= 0 && k <= 1) {
+  else if (sscanf(s, "cmy:%f/%f/%f", &c, &m, &y) == 3 ||
+           sscanf(s, "cmyk:%f/%f/%f/%f", &c, &m, &y, &k) == 4) {
+    if (c >= 0 && c <= 1 && m >= 0 && m <= 1 &&
+        y >= 0 && y <= 1 && k >= 0 && k <= 1) {
       r = (1 - c) * (1 - k) * 255;
       g = (1 - m) * (1 - k) * 255;
       b = (1 - y) * (1 - k) * 255;
     }
     else
       return false;
+  }
   else {
-    int coli = -1;
-    int len = strlen(s);
-    while (len && s[len - 1] == ' ')
-      len--;
-    for (uint i = 0; i < lengthof(xcolours); i++)
-      if (0 == strncasecmp(s, xcolours[i].name, len)) {
+    bool found = false;
+    for (uint i = 0; i < lengthof(xcolours); i++) {
+      string name = xcolours[i].name;
+      if (!strncasecmp(s, name, strlen(name))) {
         r = xcolours[i].r;
         g = xcolours[i].g;
         b = xcolours[i].b;
-        coli = i;
+        found = true;
         break;
       }
-    if (coli < 0)
+    }
+    if (!found)
       return false;
   }
 
@@ -974,6 +1024,21 @@ set_option(string name, string val_str, bool from_file)
 #endif
       if (parse_colour(val_str, val_p))
         return i;
+    when OPT_COLOUR_PAIR: {
+#ifdef debug_theme
+      printf("set_option <%s> <%s>\n", name, val_str);
+#endif
+      colour_pair *pair = val_p;
+      if (parse_colour(val_str, &pair->fg)) {
+        const char *sep = strchr(val_str, ';');
+        if (!sep) {
+          pair->bg = pair->fg;
+          return i;
+        }
+        else if (parse_colour(sep + 1, &pair->bg))
+          return i;
+      }
+    }
     otherwise: {
       int len = strlen(val_str);
       if (!len)
@@ -1500,6 +1565,9 @@ load_config(string filename, int to_save)
     to_save = false;
 
   FILE * file = fopen(filename, "r");
+  //printf("load_config <%s> ok %d save %d\n", filename, !!file, to_save);
+  if (report_config && file)
+    printf("loading config <%s>\n", filename);
 
   if (to_save) {
     if (file || (!rc_filename && to_save == 2) || to_save == 3) {
@@ -1507,6 +1575,8 @@ load_config(string filename, int to_save)
 
       delete(rc_filename);
       rc_filename = path_posix_to_win_w(filename);
+      if (report_config)
+        printf("save to config <%ls>\n", rc_filename);
     }
   }
 
@@ -1590,8 +1660,12 @@ copy_config(char * tag, config * dst_p, const config * src_p)
           strset(dst_val_p, *(string *)src_val_p);
         when OPT_WSTRING:
           wstrset(dst_val_p, *(wstring *)src_val_p);
-        when OPT_INT or OPT_COLOUR:
+        when OPT_INT:
           *(int *)dst_val_p = *(int *)src_val_p;
+        when OPT_COLOUR:
+          *(colour *)dst_val_p = *(colour *)src_val_p;
+        when OPT_COLOUR_PAIR:
+          *(colour_pair *)dst_val_p = *(colour_pair *)src_val_p;
         otherwise:
           *(char *)dst_val_p = *(char *)src_val_p;
       }
@@ -1605,6 +1679,18 @@ init_config(void)
   copy_config("init", &cfg, &default_cfg);
 }
 
+static void
+fix_config(void)
+{
+  // Avoid negative sizes.
+  cfg.rows = max(1, cfg.rows);
+  cfg.cols = max(1, cfg.cols);
+  cfg.scrollback_lines = max(0, cfg.scrollback_lines);
+
+  // Limit size of scrollback buffer.
+  cfg.scrollback_lines = min(cfg.scrollback_lines, cfg.max_scrollback_lines);
+}
+
 void
 finish_config(void)
 {
@@ -1615,14 +1701,11 @@ finish_config(void)
     (void)load_messages_lang("messages");
 #endif
 #ifdef debug_opterror
-  opterror("Täst L %s %s", false, "b�h", "b�h�");
+  opterror("Täst L %s %s", false, "b�h", "b�h�");
   opterror("Täst U %s %s", true, "böh", "büh€");
 #endif
 
-  // Avoid negative sizes.
-  cfg.rows = max(1, cfg.rows);
-  cfg.cols = max(1, cfg.cols);
-  cfg.scrollback_lines = max(0, cfg.scrollback_lines);
+  fix_config();
 
   // Ignore charset setting if we haven't got a locale.
   if (!*cfg.locale)
@@ -1699,6 +1782,12 @@ save_config(void)
             colour c = *(colour *)val_p;
             fprintf(file, "%u,%u,%u", red(c), green(c), blue(c));
           }
+          when OPT_COLOUR_PAIR: {
+            colour_pair p = *(colour_pair *)val_p;
+            fprintf(file, "%u,%u,%u", red(p.fg), green(p.fg), blue(p.fg));
+            if (p.fg != p.bg)
+              fprintf(file, ";%u,%u,%u", red(p.bg), green(p.bg), blue(p.bg));
+          }
           otherwise: {
             int val = *(char *)val_p;
             opt_val *o = opt_vals[type];
@@ -1743,8 +1832,12 @@ apply_config(bool save)
           changed = strcmp(*(string *)val_p, *(string *)new_val_p);
         when OPT_WSTRING:
           changed = wcscmp(*(wstring *)val_p, *(wstring *)new_val_p);
-        when OPT_INT or OPT_COLOUR:
+        when OPT_INT:
           changed = (*(int *)val_p != *(int *)new_val_p);
+        when OPT_COLOUR:
+          changed = (*(colour *)val_p != *(colour *)new_val_p);
+        when OPT_COLOUR_PAIR:
+          changed = memcmp(val_p, new_val_p, sizeof(colour_pair));
         otherwise:
           changed = (*(char *)val_p != *(char *)new_val_p);
       }
@@ -1759,6 +1852,7 @@ apply_config(bool save)
      )
     load_messages(&new_cfg);
   win_reconfig();  // copy_config(&cfg, &new_cfg);
+  fix_config();
   if (save)
     save_config();
   bool had_theme = !!*cfg.theme_file;
@@ -2202,10 +2296,13 @@ charset_handler(control *ctrl, int event)
 static void
 lang_handler(control *ctrl, int event)
 {
-  //__ UI language
+  //__ UI localization disabled
   const wstring NONE = _W("– None –");
+  //__ UI localization: use Windows desktop setting
   const wstring WINLOC = _W("@ Windows language @");
+  //__ UI localization: use environment variable setting (LANGUAGE, LC_*)
   const wstring LOCENV = _W("* Locale environm. *");
+  //__ UI localization: use mintty configuration setting (Text - Locale)
   const wstring LOCALE = _W("= cfg. Text Locale =");
   switch (event) {
     when EVENT_REFRESH:
@@ -4213,8 +4310,8 @@ setup_config_box(controlbox * b)
     ctrl_columns(s, 2, 100, 0);
     // window-related
     ctrl_editbox(
-      //__ Options - Selection:
-      s, _("Show size while selecting (0..12)"), 24,
+      //__ Options - Selection: clock position of info popup for text size
+      s, _("Show size while selecting (0..12)"), 15,
       dlg_stdintbox_handler, &new_cfg.selection_show_size
     );
 #define dont_config_suspbuf
@@ -4236,7 +4333,7 @@ setup_config_box(controlbox * b)
                       _("Window properties"), 
   //__ Options - Window: section title
                       _("Default size"));
-  ctrl_columns(s, 5, 35, 3, 28, 4, 30);
+  ctrl_columns(s, 5, 35, 4, 28, 3, 30);
   (cols_box = ctrl_editbox(
     //__ Options - Window:
     s, _("Colu&mns"), 44, dlg_stdintbox_handler, &new_cfg.cols
@@ -4249,6 +4346,12 @@ setup_config_box(controlbox * b)
     //__ Options - Window:
     s, _("C&urrent size"), current_size_handler, 0
   )->column = 4;
+  ctrl_columns(s, 1, 100);
+  ctrl_checkbox(
+    //__ Options - Window:
+    s, _("Re&wrap on resize"),
+    dlg_stdcheckbox_handler, &new_cfg.rewrap_on_resize
+  );
 
   s = ctrl_new_set(b, _("Window"), null, null);
   ctrl_columns(s, 2, 66, 34);
@@ -4344,7 +4447,7 @@ setup_config_box(controlbox * b)
     s, _("&Type"), 100, term_handler, 0
   )->column = 0;
   ctrl_editbox(
-    //__ Options - Terminal:
+    //__ Options - Terminal: answerback string for ^E request
     s, _("&Answerback"), 100, dlg_stdstringbox_handler, &new_cfg.answerback
   )->column = 1;
 
@@ -4367,7 +4470,7 @@ setup_config_box(controlbox * b)
   )->column = 0;
   ctrl_columns(s, 1, 100);  // reset column stuff so we can rearrange them
   // balance column widths of the following 3 fields 
-  // to accomodate different length of localized labels
+  // to accommodate different length of localized labels
   int strwidth(string s0) {
     int len = 0;
     unsigned char * sp = (unsigned char *)s0;
@@ -4428,5 +4531,10 @@ setup_config_box(controlbox * b)
     //__ Options - Terminal:
     s, _("Prompt about running processes on &close"),
     dlg_stdcheckbox_handler, &new_cfg.confirm_exit
+  );
+  ctrl_checkbox(
+    //__ Options - Terminal:
+    s, _("Status Line"),
+    dlg_stdcheckbox_handler, &new_cfg.status_line
   );
 }

@@ -59,7 +59,10 @@ else ifeq ($(TARGET), x86_64-pc-msys)
   platform := msys64
   zip_files := ../docs/readme-msys.html
 else
-  $(error Target '$(TARGET)' not supported)
+  # just warning to support cross-generation of data files
+warn=[30;48;5;11m
+norm=[m
+  $(warning $(warn) Target '$(TARGET)' not supported $(norm))
 endif
 
 CPPFLAGS := -DTARGET=$(TARGET)
@@ -97,6 +100,8 @@ ifneq ($(platform), msys)
 endif
 # support cygwin debug package (use += to accept injected options)
 CFLAGS += -std=gnu99 -include std.h -Wall -Wextra -Wundef -Werror $(SECUR)
+# verify additional flags that are also injected into pkg build by cygport
+CFLAGS += -Wformat-security
 
 ifeq ($(shell VER=`$(CC) -dumpversion`; expr $${VER%.*} '>=' 4.5), 1)
   CFLAGS += -mtune=atom
@@ -111,7 +116,7 @@ ifneq ($(platform), msys)
 endif
 extralibs=$(scriptlib) $(downldlib) $(emojilib)
 LDFLAGS := -L$(shell $(CC) -print-file-name=w32api) -static-libgcc
-LDLIBS := -mwindows $(extralibs) -lcomctl32 -limm32 -lwinmm -lwinspool -lole32 -luuid
+LDLIBS := -mwindows $(extralibs) -lcomctl32 -limm32 -lwinmm -lwinspool -lole32 -luuid -lmpr
 #override LDFLAGS += -L$(shell $(CC) -print-file-name=w32api) -static-libgcc
 #override LDLIBS += -mwindows $(extralibs) -lcomctl32 -limm32 -lwinmm -lwinspool -lole32 -luuid
 
@@ -190,18 +195,21 @@ $(bin): $(bins)
 WGET=curl -R -O --connect-timeout 55
 WGET+=-z $@
 
+clean-x11:
+	rm -f rgb.t composed.t
+
 rgb.t:	# /usr/share/X11/rgb.txt # X11 color names, from package 'rgb'
 #	255 250 250		snow
 #	->
 #		{255, 250, 250, "snow"},
 	sed -e 's,	, ,g' -e 's/ *\([0-9][0-9]*\) *\([0-9][0-9]*\) *\([0-9][0-9]*\) *\([^ ].*[^ ]\) */	{\1, \2, \3, "\4"},/' /usr/share/X11/rgb.txt > rgb.t
 
-combdata=combining.t combdouble.t combined.t
+combdata=combining.t combdouble.t combined.t formatting.t
 unidata=$(combdata) ambiguous.t scripts.t blocks.t casefold.t bidiclasses.t mirroring.t brackets.t canonical.t wide.t unicodever.t
 emojidata=emojibase.t emojiseqs.t
 
 unicodedata=UnicodeData.txt EastAsianWidth.txt Blocks.txt Scripts.txt CaseFolding.txt BidiMirroring.txt BidiBrackets.txt BidiCharacterTest.txt BidiTest.txt NameAliases.txt
-unicodeemoji=emoji-data.txt emoji-sequences.txt emoji-variation-sequences.txt emoji-zwj-sequences.txt
+unicodeemoji=emoji-data.txt emoji-sequences.txt emoji-variation-sequences.txt emoji-zwj-sequences.txt emoji-test.txt
 
 clean-unicode:
 	rm -f $(unidata) $(emojidata)
@@ -211,6 +219,12 @@ clean-unicode-data:	clean-unicode
 
 combining.t:	# UnicodeData.txt Blocks.txt
 	uniset +cat=Me +cat=Mn +cat=Cf -00AD +1160-11FF +200B +D7B0-D7C6 +D7CB-D7FB c > combining.t
+	# xterm 373:
+	#uniset +cat=Me +cat=Mn +0600-0605 +061C +06DD +070F +1160-11FF +D7B0-D7C6 +D7CB-D7FB c > combining.t
+
+formatting.t:	# UnicodeData.txt Blocks.txt
+	# xterm 373:
+	#uniset +cat=Cf -00AD -0600-0605 -061C -06DD -070F c > formatting.t
 
 ambiguous.t:	# WIDTH-A # UnicodeData.txt Blocks.txt
 	sh ./mkwidthA
@@ -264,7 +278,8 @@ unibasever = `sed -e '/^\# Blocks-/ s,[^0-9]*\([0-9]*\)\..*,\1.0,' -e t -e d Blo
 
 # Emoji version may advance Unicode version
 emojiver = $(unibasever)
-emojiver = 13.1
+# override Emoji version if not in sync (or extract from emoji-data.txt)
+emojiver = 15.0
 
 # until 12.0:
 #emoji-%.txt:	Blocks.txt
@@ -273,6 +288,8 @@ emojiver = 13.1
 emoji-sequences.txt:	Blocks.txt
 	$(WGET) http://www.unicode.org/Public/emoji/$(emojiver)/$@
 emoji-zwj-sequences.txt:	Blocks.txt
+	$(WGET) http://www.unicode.org/Public/emoji/$(emojiver)/$@
+emoji-test.txt:	Blocks.txt
 	$(WGET) http://www.unicode.org/Public/emoji/$(emojiver)/$@
 emoji-data.txt:	Blocks.txt
 	$(WGET) http://www.unicode.org/Public/$(univer)/ucd/emoji/$@
@@ -295,7 +312,7 @@ univer:	Blocks.txt
 emojibase.t:	# emoji-data.txt emoji-variation-sequences.txt emoji-sequences.txt emoji-zwj-sequences.txt
 	bash ./mkemojis base > $@
 
-emojiseqs.t:	# emoji-sequences.txt emoji-zwj-sequences.txt
+emojiseqs.t:	# emoji-sequences.txt emoji-zwj-sequences.txt emoji-test.txt
 	bash ./mkemojis seqs > $@
 
 #compose_list=/usr/share/X11/locale/en_US.UTF-8/Compose
@@ -305,12 +322,15 @@ composed.t:	# $(compose_list) $(keysymdefs)
 	sh ./mkcomposedt > composed.t
 
 XGETTEXT_OPTS=--package-name=mintty #--package-version=$(version)
-#XGETTEXT_OPTS+=--msgid-bugs-address=mintty@...
+XGETTEXT_OPTS+=--msgid-bugs-address=https://github.com/mintty/mintty/issues/700
 
 _:	localization checkloc
-localization:
+localization:	pot po
+pot:
 	mkdir -p ../lang
-	xgettext --from-code=UTF-8 -k_ -k_W -k__ -c__ $(XGETTEXT_OPTS) *.c appinfo.h -o- | grep -v "^#, c-format" > ../lang/messages.pot
+	xgettext --from-code=UTF-8 -k_ -k_W -k__ -c__ $(XGETTEXT_OPTS) *.c appinfo.h -o- | grep -v "^#, c-format" > ../lang/messages.pott
+	cd ../lang; if diff -I POT-Creation-Date messages.pot messages.pott | grep . > /dev/null; then /bin/mv messages.pott messages.pot; else /bin/rm messages.pott; fi
+po:
 	cd ../lang; for po in *.po; do [ "$$po" = en.po ] || msgmerge -U "$$po" messages.pot; done
 checkloc:
 	cd ../lang; ! grep "^#, fuzzy" *.po
@@ -347,8 +367,8 @@ $(pdf): ../docs/$(NAME).1
 
 html := ../docs/$(NAME).1.html
 html: $(html)
-$(html): ../docs/$(NAME).1
-	sed -f html.sed $< | groff -t -man -mwww -Thtml > $@
+$(html): ../docs/$(NAME).1 htmlroff.sed htmlhtml.sed
+	sed -f htmlroff.sed $< | groff -t -man -mwww -Thtml | sed -f htmlhtml.sed > $@
 
 clean:
 	#rm -rf *.d *.o $(NAME)*
@@ -370,7 +390,8 @@ SRCDEBUG:= -e "^(f*printf|\#define debug)" # \# make-escape to #
 SRCDEBUG+= -e "^(if|do|for|while) *[({]"
 SRCDEBUG+= -e "\((false|0) *&"
 SRCDEBUG+= -e "\((true|1) *\|"
-SRCDEBUG+= -e "& 0($|[^bx])"
+#SRCDEBUG+= -e "& 0($|[^bx])"
+SRCDEBUG+= -e "\(0 &"
 SRCDEBUG+= -e "^///"
 checksrc:
 	if egrep -an $(SRCDEBUG) *.[hc]; then false; fi

@@ -255,6 +255,7 @@ term_cursor_reset(term_cursor *curs)
   curs->cset_single = CSET_ASCII;
 
   curs->bidimode = 0;
+  curs->rewrap_on_resize = true;
 
   curs->origin = false;
 }
@@ -302,6 +303,7 @@ term_reset(bool full)
 
   if (full) {
     term.lrmargmode = false;
+    term.dim_margins = cfg.dim_margins;
     term.deccolm_allowed = cfg.enable_deccolm_init;  // not reset by xterm
     term.vt220_keys = vt220(cfg.term);  // not reset by xterm
     term.app_keypad = false;  // xterm only with RIS
@@ -310,6 +312,7 @@ term_reset(bool full)
     term.repeat_rate = 0;
     term.attr_rect = false;
     term.deccolm_noclear = false;
+    term.erase_to_screen = false;
   }
   term.modify_other_keys = 0;  // xterm resets this
 
@@ -324,6 +327,7 @@ term_reset(bool full)
     term.rvideo = 0;  // not reset by xterm
     term_bell_reset(&term.bell);
     term_bell_reset(&term.marginbell);
+    term.play_tone = cfg.play_tone;
     term.margin_bell = false;  // not reset by xterm
     term.ring_enabled = false;
     term.bell_taskbar = cfg.bell_taskbar;  // not reset by xterm
@@ -349,6 +353,9 @@ term_reset(bool full)
     term.disable_bidi = false;
     term.enable_bold_colour = cfg.bold_as_colour;
     term.enable_blink_colour = true;
+    term.readline_mouse_1 = cfg.clicks_place_cursor;
+    term.readline_mouse_2 = cfg.clicks_place_cursor;
+    term.readline_mouse_3 = cfg.clicks_place_cursor;
   }
 
   term.virtuallines = 0;
@@ -369,6 +376,16 @@ term_reset(bool full)
   if (full) {
     term.blink_is_real = cfg.allow_blinking;
     term.hide_mouse = cfg.hide_mouse;
+  }
+
+  term_switch_status(false);
+  if (full) {
+    term_clear_status();
+    // restore initial status line unless type 2 selected
+    if (cfg.status_line && term.st_type == 0)
+      term_set_status_type(1, 0);
+    else if (!cfg.status_line && term.st_type == 1)
+      term_set_status_type(0, 0);
   }
 
   if (full) {
@@ -401,6 +418,7 @@ term_reset(bool full)
   term.iso_guarded_area = false;
 
   term.detect_progress = cfg.progress_bar;
+  term.progress_scan = cfg.progress_scan;
   taskbar_progress(-9);
 
   term.suspend_update = 0;
@@ -465,6 +483,10 @@ term_reconfig(void)
     term.bell_popup = new_cfg.bell_popup;
   if (strcmp(new_cfg.term, cfg.term))
     term.vt220_keys = vt220(new_cfg.term);
+  // status line
+  if (new_cfg.status_line != cfg.status_line
+      && new_cfg.status_line != term.st_type && term.st_type != 2)
+    toggle_status_line();
 }
 
 static int
@@ -1007,47 +1029,103 @@ term_clear_search(void)
   term.results.xquery_length = 0;
 }
 
+/*
+   After term_reflow has expanded the scrollback buffer beyond its maximum 
+   (for shunting lines to be rewrapped), it should trim the buffer again 
+   to its limit.
+ */
 static void
-scrollback_push(uchar *line)
+scrollback_trim(void)
 {
-  if (term.sblines == term.sblen) {
+  // Trim scrollback buffer back to max size after shunting reflow lines
+  //printf("scrollback_trim %p %d len %d lines %d tmp %d pos %d disp %d\n", line, newrows, term.sbsize, term.sblines, term.tempsblines, term.sbpos, term.disptop);
+  uchar **scrollback = newn(uchar *, cfg.scrollback_lines);
+  if (!scrollback)
+    return;
+  int new_sblines = 0;
+  for (int i = 0; i < term.sblines; i++) {
+    uchar *cline = term.scrollback[(i + term.sbpos) % term.sblines];
+    if (i < term.sblines - cfg.scrollback_lines)
+      free(cline);
+    else
+      scrollback[new_sblines++] = cline;
+  }
+  free(term.scrollback);
+  term.scrollback = scrollback;
+  term.sblines = new_sblines;
+  term.sbpos = new_sblines;
+  term.sbsize = cfg.scrollback_lines;
+  term.tempsblines = term.sblines;
+
+  if (term.sbpos == term.sbsize)
+    term.sbpos = 0;
+  //printf("-> scrollback_trim len %d lines %d tmp %d pos %d disp %d\n", term.sbsize, term.sblines, term.tempsblines, term.sbpos, term.disptop);
+}
+
+static void
+scrollback_push(uchar *line, int newrows)
+{
+  //printf("scrollback_push %p %d len %d lines %d tmp %d pos %d disp %d\n", line, newrows, term.sbsize, term.sblines, term.tempsblines, term.sbpos, term.disptop);
+  if (term.sbpos == term.sbsize)
+    term.sbpos = 0;
+  if (term.sblines == term.sbsize) {
     // Need to make space for the new line.
-    if (term.sblen < cfg.scrollback_lines) {
+    if (newrows || term.sbsize < cfg.scrollback_lines) {
+      assert(newrows || term.sbpos == 0);
       // Expand buffer
-      assert(term.sbpos == 0);
-      int new_sblen = min(cfg.scrollback_lines, term.sblen * 3 + 1024);
-      term.scrollback = renewn(term.scrollback, new_sblen);
-      term.sbpos = term.sblen;
-      term.sblen = new_sblen;
+      int new_sbsize = newrows
+                      ? (term.sbsize + newrows) * 2
+                      : min(cfg.scrollback_lines, term.sbsize * 3 + 1024);
+      uchar **scrollback = renewn(term.scrollback, new_sbsize);
+      if (!scrollback)
+        goto scrollback_fallback;
+      if (term.sbpos) {
+        // Need to expand full buffer which may have wrapped around, so 
+        // we need to rebase the ring buffer for well-sorted linear expansion;
+        // use expanded part of buffer for shunting
+        for (int i = 0; i < term.sblines; i++)
+          scrollback[term.sbsize + i] = scrollback[(term.sbpos + i) % term.sbsize];
+        for (int i = 0; i < term.sblines; i++)
+          scrollback[i] = scrollback[term.sbsize + i];
+      }
+      term.scrollback = scrollback;
+      term.sbpos = term.sbsize;
+      term.sbsize = new_sbsize;
     }
-    else if (term.sblines) {
-      // Throw away the oldest line
+    else
+  scrollback_fallback:  // whoo! this works
+    if (term.sblines) {
+      // Throw away the oldest line;
+      // sbpos needs to be normalized % sbsize here
       free(term.scrollback[term.sbpos]);
       term.sblines--;
     }
-    else
+    else {
       return;
+    }
   }
-  assert(term.sblines < term.sblen);
-  assert(term.sbpos < term.sblen);
+  assert(term.sblines < term.sbsize);
+  assert(term.sbpos < term.sbsize);
   term.scrollback[term.sbpos++] = line;
-  if (term.sbpos == term.sblen)
+  if (term.sbpos == term.sbsize)
     term.sbpos = 0;
   term.sblines++;
   if (term.tempsblines < term.sblines)
     term.tempsblines++;
+  //printf("-> scrollback_push len %d lines %d tmp %d pos %d disp %d\n", term.sbsize, term.sblines, term.tempsblines, term.sbpos, term.disptop);
 }
 
 static uchar *
 scrollback_pop(void)
 {
   assert(term.sblines > 0);
-  assert(term.sbpos < term.sblen);
+  assert(term.sbpos < term.sbsize);
   term.sblines--;
   if (term.tempsblines)
     term.tempsblines--;
   if (term.sbpos == 0)
-    term.sbpos = term.sblen;
+    term.sbpos = term.sbsize;
+  //printf("-> scrollback_pop len %d lines %d tmp %d pos %d disp %d\n", term.sbsize, term.sblines, term.tempsblines, term.sbpos - 1, term.disptop);
   return term.scrollback[--term.sbpos];
 }
 
@@ -1061,9 +1139,410 @@ term_clear_scrollback(void)
     free(scrollback_pop());
   free(term.scrollback);
   term.scrollback = 0;
-  term.sblen = term.sblines = term.sbpos = 0;
+  term.sbsize = term.sblines = term.sbpos = 0;
   term.tempsblines = 0;
   term.disptop = 0;
+}
+
+#define dont_debug_scrollback 1
+
+// mark cursor position in order not to lose it during reflow
+#define TATTR_MARKCURS (TATTR_ACTCURS | TATTR_PASCURS)
+// determine effective line length trimmed to printed characters;
+// need to include ATTR_BOLD | ATTR_DIM for proper TAB unwrapping
+// need to include TATTR_MARKCURS for proper detection of final cursor
+#define attr_clear(attr) ((attr & (TATTR_CLEAR | ATTR_BOLD | ATTR_DIM | TATTR_MARKCURS)) == TATTR_CLEAR)
+
+#ifdef debug_scrollback
+
+static void
+printline(char * tag, termline * tl, int col)
+{
+  char * sep = "[7m▒[27m";  // ┃┇┋▒
+  printf("%s%s", tag, sep);
+  if (col < 0) {
+    col = tl->cols;
+    while (col && attr_clear(tl->chars[col - 1].attr.attr))
+      col --;
+  }
+  for (int j = 0; j <= col; j++)
+    printf("%lc", tl->chars[j].chr);
+  printf("%s%04X %d/%d wr %d tmp %d cc %d\n", sep, tl->lattr, tl->cols, tl->size, tl->wrappos, tl->temporary, tl->cc_free);
+}
+
+static void
+printsb(char * tag)
+{
+  printf("sb %s[%d@%d]-------------\n", tag, term.sblines, term.sbpos);
+  for (int i = 0; i < term.sblines; i++) {
+    uchar *cline = term.scrollback[(i + term.sbpos) % term.sblines];
+    termline *line = decompressline(cline, null);
+    printline("=", line, -1);
+    freeline(line);
+  }
+  printf("--------------------\n");
+}
+
+static void
+printsc(char * tag, char * ltag, termline **lines, int rows)
+{
+  printf("%s[%d]-------------\n", tag, rows);
+  for (int i = 0; i < rows; i++) {
+    printline(ltag, lines[i], -1);
+  }
+  printf("--------------------\n");
+}
+
+#else
+#define printline(tag, tl, col)	
+#define printsb(tag)	
+#define printsc(tag, ltag, lines, rows)	
+#endif
+
+/*
+ * Line rebreaking for screen and scrollback lines
+ */
+static void
+term_reflow(int newrows, int newcols)
+{
+  // First, mark the current cursor position;
+  // also clear old marks elsewhere;
+  // to be sure to catch the cursor position, use the new height 
+  // (lines have already been rearranged) and respective widths of each line;
+  // in case of remaining problems, we couldl further move this marking 
+  // to the beginning of term_resize()
+  for (int i = newrows - 1; i >= 0; i--)
+    for (int j = term.lines[i]->cols - 1; j >= 0; j--)
+      if (i == term.curs.y && j == term.curs.x)
+        term.lines[i]->chars[j].attr.attr |= TATTR_MARKCURS;
+      else
+        term.lines[i]->chars[j].attr.attr &= ~TATTR_MARKCURS;
+
+  // Push all screen lines to scrollback buffer
+  for (int i = 0; i < newrows; i++) {
+    termline *line = term.lines[i];
+    scrollback_push(compressline(line), newrows);
+    freeline(line);
+  }
+  printsb("<rewrap");
+
+  // Handle old scrollback buffer in local variables
+  // so we can use scrollback_push to store it back 
+  // with implicit size management
+  uchar **scrollback = term.scrollback;
+  int sbpos = term.sbpos;
+  int sblines = term.sblines;
+  // Reset scrollback buffer (don't clear contents, which we hold locally)
+  term.scrollback = 0;
+  term.sbsize = term.sblines = term.sbpos = 0;
+  term.tempsblines = 0;
+
+  int cursor_scrolled = 0;
+  void cursor_scroll(termline *tl)
+  {
+    for (int k = 0; k < tl->cols; k++)
+      if (tl->chars[k].attr.attr & TATTR_MARKCURS) {
+        cursor_scrolled = 0;
+        break;
+      }
+    cursor_scrolled ++;
+  }
+
+  // Reflow scrollback buffer
+  int i = 0;
+  while (i < sblines) {
+#ifdef wrapbuf
+#warning missing wrap buffer size management
+    termline *linebuf[99];  // wrap buffer
+    int lin = 0;
+#define inbuf linebuf[lin]
+#else
+    termline * inbuf;
+#endif
+
+    // fetch (without resizeline)
+    uchar *cline = scrollback[(i + sbpos) % sblines];
+    inbuf = decompressline(cline, null);
+    int actcols = inbuf->cols;
+    // determine actual non-empty columns
+    while (actcols && attr_clear(inbuf->chars[actcols - 1].attr.attr))
+      actcols --;
+
+    if ((!(inbuf->lattr & LATTR_WRAPPED) && actcols <= newcols)
+        || !(inbuf->lattr & LATTR_REWRAP)
+       )
+    {
+      // shortcut: skip multiple lines handling
+
+      if (newcols <= inbuf->cols)
+        // skip compressline()
+        scrollback_push(cline, newrows);
+      else {  // need to resizeline when widening
+        free(cline);
+        resizeline(inbuf, newcols);
+        scrollback_push(compressline(inbuf), newrows);
+      }
+      cursor_scroll(inbuf);
+      freeline(inbuf);
+
+      i ++;
+      continue;
+    }
+
+    free(cline);
+
+    int j = 0;  // wrapped lines (buffer) counter
+#ifdef wrapbuf
+    while ((linebuf[j]->lattr & LATTR_WRAPPED) && i + j + 1 < sblines) {
+      j++;
+      uchar *cline = scrollback[(i + j + sbpos) % sblines];
+      linebuf[j] = decompressline(cline, null);
+      free(cline);
+      if (!(linebuf[j]->lattr & LATTR_WRAPCONTD)) {
+        // drop non-continuing line (could save for later)
+        freeline(linebuf[j]);
+        j--;
+        // drop stale wrapped flag from previous line
+        linebuf[j]->lattr &= ~LATTR_WRAPPED;
+        // finish wrapped lines group
+        break;
+      }
+    }
+    printsc("wrapbuf", "~", linebuf, j + 1);
+
+#ifdef skip_rewrap
+    // ignore rewrap and clear out input wrap buffer, for testing
+    for (int jj = 0; jj <= j; jj++) {
+      scrollback_push(compressline(linebuf[jj]), newrows);
+      cursor_scroll(linebuf[jj]);
+      freeline(linebuf[jj]);
+    }
+    term.virtuallines += j;
+    goto wrapped;
+#endif
+
+    bool advance_inbuf()
+    {
+      if (lin >= j)
+        return false;
+      lin ++;
+      return true;
+    }
+#else
+    bool advance_inbuf()
+    {
+      if ((inbuf->lattr & LATTR_WRAPPED) && i + j + 1 < sblines) {
+        // drop current line
+        freeline(inbuf);
+        // advance to next line
+        j++;
+        uchar *cline = scrollback[(i + j + sbpos) % sblines];
+        inbuf = decompressline(cline, null);
+        //free(cline) unless the fetch is reverted...
+        if (!(inbuf->lattr & LATTR_WRAPCONTD)) {
+          // drop non-continuing line (could save for later)
+          freeline(inbuf);
+          // revert look-ahead
+          j--;
+          // could we drop stale wrapped flag from previous line?
+          // restore previous inbuf; inbuf->lattr &= ~LATTR_WRAPPED; ...?
+
+          // cancel wrapped lines group
+          inbuf = 0;
+          return false;
+        }
+        else {
+          free(cline);
+          return true;
+        }
+      }
+      else {
+        // drop current line
+        freeline(inbuf);
+        // finish wrapped lines group
+        inbuf = 0;
+        return false;
+      }
+    }
+#endif
+
+    // now do the actual reflow of a wrapped line group
+    int incol = -1;
+    termline *outbuf = 0;  // rewrap buffer
+    int lout = -1;
+    int outcol = newcols;
+    do {
+      bool do_wrap = outcol >= newcols;
+      if (outcol == newcols - 1 && incol < actcols - 1
+          && inbuf->chars[incol + 1].chr == UCSWIDE
+         )
+      {
+        do_wrap = true;
+        if (lout >= 0)
+          outbuf->lattr |= LATTR_WRAPPED2;
+      }
+      if (do_wrap) {
+        // flush current outbuf line, then make a new one
+        if (lout >= 0) {
+          outbuf->lattr |= LATTR_WRAPPED;
+          scrollback_push(compressline(outbuf), newrows);
+          term.virtuallines++;
+          cursor_scroll(outbuf);
+          //printline("↑", outbuf, -1);
+          freeline(outbuf);
+        }
+
+        // make a new outbuf line
+        lout = 0;
+        outbuf = newline(newcols, true);
+        outbuf->lattr = inbuf->lattr & ~(LATTR_WRAPPED | LATTR_WRAPPED2 | LATTR_WRAPCONTD);
+        // position output column
+        if (incol >= 0) {
+          // subsequent lines
+          outcol = 0;
+          outbuf->lattr |= LATTR_WRAPCONTD;
+        }
+        else
+          // first line
+          outcol = -1;  // include initial combining character
+
+        // char copy follows line allocation => last wrapped line is not empty
+      }
+      copy_termchar(outbuf, outcol, &inbuf->chars[incol]);
+      outcol ++;
+      incol ++;
+      if (incol >= actcols) {
+        // fetch a new inbuf line
+        if (!advance_inbuf())
+          break;
+
+        incol = 0;
+        actcols = inbuf->cols;
+        // determine actual non-empty columns
+        while (actcols && attr_clear(inbuf->chars[actcols - 1].attr.attr))
+          actcols --;
+      }
+    } while (true);
+    // flush last outbuf line
+    if (outbuf) {
+      scrollback_push(compressline(outbuf), newrows);
+      cursor_scroll(outbuf);
+      //printline("↑", outbuf, -1);
+      freeline(outbuf);
+    }
+    //printf("end rewrap loop %d -> %d\n", j, lout);
+
+#ifdef skip_rewrap
+  wrapped:
+#endif
+
+    i += j + 1;
+    term.virtuallines -= j;
+  }
+  free(scrollback);
+  printsb(">rewrap");
+
+  // Rebase graphics positions.
+  // Make sure the anchor position (top-left cell of image) is registered 
+  // as the new image position:
+  // scan lines right to left, scan scrollback buffer bottom to top, so the 
+  // top-left cell of each image will be checked last and get registered; 
+  // this could be changed to a forward approach (reducing image searches) 
+  // if images already handled were remembered in a cache, or marked in 
+  // the image list somehow...
+  for (int i = term.sblines - 1; i >= 0; i--) {
+    uchar *cline = term.scrollback[(i + term.sbpos) % term.sblines];
+    termline *line = decompressline(cline, null);
+    for (int j = line->cols - 1; j >= 0; j--) {
+      termchar * tc = &line->chars[j];
+      if (tc->chr == SIXELCH) {
+        imglist * cur = 0;
+        for (cur = term.imgs.first; cur; cur = cur->next) {
+          if (cur->imgi == tc->attr.imgi)
+            break;
+          //if (cur->top - term.virtuallines >= topline)
+          //  cur->top += lines;
+        }
+        if (cur) {
+          //printf("%lld:%d -> @%d:%d (virt %lld dtop %d) imgi %d %d\n", cur->top, cur->left, i, j, term.virtuallines, term.disptop, tc->attr.imgi, cur->imgi);
+          cur->left = cur->left;
+          cur->top = cur->top;
+        }
+      }
+    }
+#ifdef change_sixel_cells
+    if (changed_line) {
+      uchar * nline = compressline(line);
+      if (nline) {
+        term.scrollback[(i + term.sbpos) % term.sblines] = nline;
+        free(cline);
+      }
+    }
+#endif
+    freeline(line);
+  }
+  term.virtuallines = term.sblines - newrows;
+
+  // Pop all screen lines back from scrollback buffer;
+  // we need to handle the case that, after reflow, there are fewer lines 
+  // available from the scrollback than we need to fill the screen;
+  // as a simple solution, we just align the restored lines towards the bottom
+  // and fill up above with empty lines;
+  // alternatively, we could push additional empty lines into the scrollback 
+  // before pulling back a full screen, in that case from the top and 
+  // handling screen lines as a stack, and apply some final fixing ...
+  for (int i = newrows - 1; i >= 0; i--) {
+#ifdef restore_to_top
+#warning this "fix" does not work after having pushed additional lines...
+    if (i >= term.sblines)
+      term.lines[i] = newline(newcols, false);
+    else
+#endif
+    if (term.sblines > 0) {
+      uchar *cline = scrollback_pop();
+      termline *line = decompressline(cline, null);
+      resizeline(line, newcols);  // to be safe; probably not needed here
+      //printline("↓", line, -1);
+      free(cline);
+      line->temporary = false;  /* reconstituted line is now real */
+      // don't free(term.lines[i]);  // freed above (pushing all screen lines)
+      term.lines[i] = line;
+    }
+    else {
+      term.lines[i] = newline(newcols, false);
+    }
+  }
+  printsc("screen >rewrap", ":", term.lines, newrows);
+
+  // Last, find the marked cursor position and target current cursor to it;
+  // go backwards in case an old cursor mark, that had been scrolled out 
+  // and thus not cleared, was now scrolled in again;
+  // use new size for scanning.
+  // Fallback in case cursor was wrapped / scrolled out of screen:
+  term.curs.y = 0;
+  term.curs.x = 0;
+  // search for cursor marker
+  for (int i = newrows - 1; i >= 0; i--)
+    // need to search whole stored line, even if longer than screen width,
+    // in order to find zoomed-out cursor position
+    for (int j = term.lines[i]->cols - 1; j >= 0; j--)
+      if (term.lines[i]->chars[j].attr.attr & TATTR_MARKCURS) {
+        term.curs.y = i;
+        term.curs.x = min(j, newcols - 1);
+        term.lines[i]->chars[j].attr.attr &= ~TATTR_MARKCURS;
+        i = 0;
+        break;
+      }
+
+  // Trim scrollback buffer to max config size
+  scrollback_trim();
+
+  if (cursor_scrolled > newrows) {
+    // scroll back to display previous cursor position
+    //term.new_disptop = newrows - cursor_scrolled;  // need to check for existence
+    // currently cancelled in term_resize()
+    //term_scroll(0, ...);  // do this later, would crash here
+  }
 }
 
 /*
@@ -1073,6 +1552,7 @@ void
 term_resize(int newrows, int newcols)
 {
   trace_resize(("--- term_resize %d %d\n", newrows, newcols));
+
   bool on_alt_screen = term.on_alt_screen;
   term_switch_screen(0, false);
 
@@ -1082,6 +1562,31 @@ term_resize(int newrows, int newcols)
   term.marg_bot = newrows - 1;
   term.marg_left = 0;
   term.marg_right = newcols - 1;
+
+  // Disable status area temporarily
+  // to avoid the complexity to consider it during resize or even reflow;
+  // to round up, we will finally clear it explicitly, so we also 
+  // do not need to save status area contents;
+  // ref: DEC clears status line on DECCOLM which we generalize to resize
+  int save_st_rows = term.st_rows;
+  bool save_st_act = term.st_active;
+  // adjust status line state
+  if (term.st_rows) {
+    if (save_st_act) {
+      term_switch_status(false);
+    }
+    for (int i = term.rows; i < term_allrows; i++) {
+      freeline(term.lines[i]);
+      term.lines[i] = newline(newcols, false);
+    }
+    newrows += term.st_rows;
+
+    // remove status area during resize
+    term.rows = term_allrows;
+    term.st_rows = 0;
+  }
+  // remember y of "normal" area
+  short old_term_y = term.curs.y;
 
  /*
   * Resize the screen and scrollback. We only need to shift
@@ -1105,7 +1610,6 @@ term_resize(int newrows, int newcols)
 
   termlines *lines = term.lines;
   term_cursor *curs = &term.curs;
-  term_cursor *saved_curs = &term.saved_cursors[term.on_alt_screen];
 
   // Shrink the screen if newrows < rows
   if (newrows < term.rows) {
@@ -1116,7 +1620,7 @@ term_resize(int newrows, int newcols)
     // Push removed lines into scrollback
     for (int i = 0; i < store; i++) {
       termline *line = lines[i];
-      scrollback_push(compressline(line));
+      scrollback_push(compressline(line), 0);
       term.virtuallines++;
       freeline(line);
     }
@@ -1130,7 +1634,6 @@ term_resize(int newrows, int newcols)
 
     // Adjust cursor position
     curs->y = max(0, curs->y - store);
-    saved_curs->y = max(0, saved_curs->y - store);
 
     // Adjust image position
     term.virtuallines += min(0, store);
@@ -1141,7 +1644,9 @@ term_resize(int newrows, int newcols)
   // Expand the screen if newrows > rows
   if (newrows > term.rows) {
     int added = newrows - term.rows;
+    // determine how many lines to restore from scrollback
     int restore = min(added, term.tempsblines);
+    // determine how many empty lines to add
     int create = added - restore;
 
     // Fill bottom of screen with blank lines
@@ -1162,7 +1667,6 @@ term_resize(int newrows, int newcols)
 
     // Adjust cursor position
     curs->y += restore;
-    saved_curs->y += restore;
 
     // Adjust image position
     term.virtuallines -= restore;
@@ -1171,6 +1675,10 @@ term_resize(int newrows, int newcols)
   // Resize lines
   for (int i = 0; i < newrows; i++)
     resizeline(lines[i], newcols);
+
+  // Reflow screen and scrollback buffer to new width
+  if (cfg.rewrap_on_resize && newcols != term.cols)
+    term_reflow(newrows, newcols);
 
   // Make a new displayed text buffer.
   if (term.displines) {
@@ -1203,8 +1711,11 @@ term_resize(int newrows, int newcols)
     term.tabs[i] = term.newtab && (i % 8 == 0);
 
   // Check that the cursor positions are still valid.
-  assert(0 <= curs->y && curs->y < newrows);
-  assert(0 <= saved_curs->y && saved_curs->y < newrows);
+  //assert(0 <= curs->y && curs->y < newrows);
+  // rather be on the safe side:
+
+  // Ensure valid cursor positions.
+  curs->y = min(curs->y, newrows - 1);
   curs->x = min(curs->x, newcols - 1);
 
   curs->wrapnext = false;
@@ -1216,6 +1727,48 @@ term_resize(int newrows, int newcols)
   term.rows0 = newrows;
   term.cols0 = newcols;
 
+  // Status area handling
+
+  // limit status size
+  // here term.rows still include term.st_rows
+  if (save_st_rows >= term.rows / 2) {
+    save_st_rows = max(0, term.rows / 2 - 1);
+    if (!save_st_rows) {
+      // clear status mode
+      save_st_act = false;
+      term.st_type = 0;
+    }
+  }
+  // restore status geometry
+  term.rows -= save_st_rows;
+  term.st_rows = save_st_rows;
+  // fix bottom margin in case status area got resized
+  newrows = term.rows;
+  term.marg_bot = newrows - 1;
+  // restore status line area
+  if (save_st_rows) {
+    for (int i = term.rows; i < term_allrows; i++) {
+      freeline(term.lines[i]);
+      term.lines[i] = newline(newcols, false);
+    }
+    // scroll cursor position out of status line area
+    int n = old_term_y - term.rows + 1;
+    if (n > 0) {
+      // this adjustment must be done after fixing rows/st_rows
+      // but before restoring st_active
+      term_do_scroll(term.marg_top, term.marg_bot + save_st_rows, n, true);
+      curs->y = max(0, curs->y - n);
+    }
+    // restore status mode
+    // must call after restoring (and adjusting) term.rows
+    term_switch_status(save_st_act);
+  }
+  // clear status area on resize (as DEC clears on DECCOLM);
+  // also this simplifies handling above
+  if (term.st_type == 2)
+    term_clear_status();
+
+  // Return to alternate screen
   term_switch_screen(on_alt_screen, false);
 }
 
@@ -1237,6 +1790,14 @@ term_switch_screen(bool to_alt, bool reset)
   term.lines = term.other_lines;
   term.other_lines = oldlines;
 
+  // keep status area (xterm 373)
+  if (term.st_type == 2)
+    for (int i = term.rows; i < term_allrows; i++) {
+      freeline(term.lines[i]);
+      term.lines[i] = term.other_lines[i];
+      term.other_lines[i] = newline(term.cols, false);
+    }
+
   /* swap image list */
   imglist * first = term.imgs.first;
   imglist * last = term.imgs.last;
@@ -1250,6 +1811,136 @@ term_switch_screen(bool to_alt, bool reset)
 
   if (to_alt && reset)
     term_erase(false, false, true, true);
+}
+
+/*
+ * Clear status area.
+ */
+void
+term_clear_status(void)
+{
+  term_cursor_reset(&term.st_other_curs);
+  term_cursor_reset(&term.st_saved_curs);
+
+  // clear status lines
+  for (int i = term.rows; i < term_allrows; i++) {
+    freeline(term.lines[i]);
+    term.lines[i] = newline(term.cols, false);
+  }
+
+  // home status cursor position
+  if (term.st_active) {
+    term.curs.y = term.rows;
+    term.curs.x = 0;
+  }
+  else {
+    term.st_other_curs.y = 0;  // saved status cursor is normalized to 0
+    term.st_other_curs.x = 0;
+  }
+}
+
+/*
+ * Set status type.
+ */
+void
+term_set_status_type(int type, int lines)
+{
+  /*
+    Unlike xterm, we do not resize the window when changing 
+    status area size; this does not only avoid trouble in full-screen 
+    or maximized mode, it also complies with DEC (VT420 p. 221, VT520 p. 5-147):
+	Notes on DECSSDT
+	• If you select no status line (Ps = 0), the terminal uses the 
+	  line as an additional user window line to display data.
+    As an extension, mintty supports a multi-line status area, 
+    configured with a second parameter to DECSSDT 2.
+    The suggestion of such an option could be interpreted from VT520 p. 2-35:
+	[The number of data display lines visible, not counting any status lines.]
+    although that may just be referring to status lines of multiple sessions.
+  */
+  int old_st_rows = term.st_rows;
+  switch (type) {
+    when 0: 
+            term_clear_status();
+            term.st_rows = 0;
+    when 1: 
+            if (term.st_type == 2)
+              term_clear_status();
+            term.st_type = 1; term.st_rows = 1;
+    when 2: 
+            if (term.st_type != 2)
+              term_clear_status();
+            term.st_type = 2;
+            if (lines) {
+              if (lines >= term_allrows / 2)
+                term.st_rows = max(0, term_allrows / 2 - 1);
+              else
+                term.st_rows = lines;
+            }
+            else
+              term.st_rows = 1;
+    otherwise: return;
+  }
+  if (!term.st_rows) {
+    term.st_type = 0;
+    term_switch_status(false);
+  }
+  if (term.st_type != 2)
+    term_switch_status(false);
+  if (term.st_rows != old_st_rows) {
+    // don't need to win_adapt_term_size(false, false);
+    int newrows = term.rows + old_st_rows - term.st_rows;
+    // scroll cursor position out of status line area
+    int n = term.curs.y - newrows + 1;
+    if (n > 0) {
+      bool old_st_act = term.st_active;
+      term_switch_status(false);
+      term_do_scroll(term.marg_top, term.marg_bot, n, true);
+      // fix up
+      term.curs.y = max(0, term.curs.y - n);
+      term_switch_status(old_st_act);
+    }
+    // don't need to term_resize(newrows, -term.cols);
+    term.rows = newrows;
+    term.marg_top = 0;
+    term.marg_bot = newrows - 1;
+    term.marg_left = 0;
+    term.marg_right = term.cols - 1;
+    // clear status lines
+    for (int i = term.rows; i < term_allrows; i++) {
+      freeline(term.lines[i]);
+      term.lines[i] = newline(term.cols, false);
+    }
+    // notify child process
+    struct winsize ws = {newrows, term.cols, term.cols * cell_width, newrows * cell_height};
+    child_resize(&ws);
+  }
+}
+
+/*
+ * Swap active status line / main display.
+ */
+void
+term_switch_status(bool status_line)
+{
+  if (status_line == term.st_active)
+    return;
+
+  term.st_active = status_line;
+
+  term_cursor oldcurs = term.curs;
+  term.curs = term.st_other_curs;
+  // saved status cursor line is normalized to 0, adjust
+  if (status_line) {
+    term.curs.y += term.rows;
+    if (term.curs.y >= term_allrows)
+      term.curs.y = term_allrows - 1;
+  }
+  else
+    oldcurs.y -= term.rows;
+  term.st_other_curs = oldcurs;
+
+  term_update_cs();
 }
 
 /*
@@ -1376,6 +2067,13 @@ term_do_scroll(int topline, int botline, int lines, bool sb)
     win_update(true);
   }
 
+  // Support scrolling within (multi-line) status area
+  if (term.st_active) {
+    topline = term.rows;
+    botline = term_allrows - 1;
+    sb = false;
+  }
+
   if (term.lrmargmode && (term.marg_left || term.marg_right != term.cols - 1)) {
     scroll_rect(topline, botline, lines);
     return;
@@ -1434,6 +2132,19 @@ term_do_scroll(int topline, int botline, int lines, bool sb)
     memmove(top + lines, top, moved_lines * sizeof(termline *));
     memcpy(top, recycled, sizeof recycled);
 
+    // unscroll: Restore lines from scrollback
+    if (sb && topline == 0 && !term.on_alt_screen && cfg.scrollback_lines) {
+      for (int i = topline + lines - 1; i >= topline && term.sblines > 0; i--) {
+        uchar *cline = scrollback_pop();
+        termline *line = decompressline(cline, null);
+        resizeline(line, term.cols);  // ensure sufficient line length
+        free(cline);
+        line->temporary = false;  /* reconstituted line is now real */
+        freeline(term.lines[i]);
+        term.lines[i] = line;
+      }
+    }
+
     // Move selection markers if they're within the scroll region
     void scroll_pos(pos *p) {
       if (!term.show_other_screen && p->y >= topline && p->y < botline) {
@@ -1461,7 +2172,7 @@ term_do_scroll(int topline, int botline, int lines, bool sb)
     // normal screen and scrollback is actually enabled.
     if (sb && topline == 0 && !term.on_alt_screen && cfg.scrollback_lines) {
       for (int i = 0; i < lines; i++)
-        scrollback_push(compressline(term.lines[i]));
+        scrollback_push(compressline(term.lines[i]), 0);
 
       // Shift viewpoint accordingly if user is looking at scrollback
       if (term.disptop < 0)
@@ -1500,6 +2211,10 @@ clear_wrapcontd(termline * line, int y)
   }
 }
 
+// consider status area for erasing
+#define top_y (term.st_active ? term.rows : 0)
+#define bot_y (term.st_active ? term_allrows : term.rows)
+
 /*
  * Erase a large portion of the screen: the whole screen, or the
  * whole line, or parts thereof.
@@ -1525,12 +2240,12 @@ term_erase(bool selective, bool line_only, bool from_begin, bool to_end)
   }
 
   if (from_begin)
-    start = (pos){.y = line_only ? curs->y : 0, .x = 0};
+    start = (pos){.y = line_only ? curs->y : top_y, .x = 0};
   else
     start = (pos){.y = curs->y, .x = curs->x};
 
   if (to_end)
-    end = (pos){.y = line_only ? curs->y + 1 : term.rows, .x = 0};
+    end = (pos){.y = line_only ? curs->y + 1 : bot_y, .x = 0};
   else
     end = (pos){.y = curs->y, .x = curs->x}, incpos(end);
 
@@ -1549,7 +2264,7 @@ term_erase(bool selective, bool line_only, bool from_begin, bool to_end)
     * we're fully erasing them, erase by scrolling and keep the
     * lines in the scrollback. This behaviour is not compatible with xterm. */
     int scrolllines = end.y;
-    if (end.y == term.rows) {
+    if (end.y == bot_y) {
      /* Shrink until we find a non-empty row. */
       scrolllines = term_last_nonempty_line() + 1;
     }
@@ -1558,7 +2273,7 @@ term_erase(bool selective, bool line_only, bool from_begin, bool to_end)
 
    /* After an erase of lines from the top of the screen, we shouldn't
     * bring the lines back again if the terminal enlarges (since the user or
-    * application has explictly thrown them away). */
+    * application has explicitly thrown them away). */
     if (!term.on_alt_screen)
       term.tempsblines = 0;
   }
@@ -1577,11 +2292,12 @@ term_erase(bool selective, bool line_only, bool from_begin, bool to_end)
                !(line->chars[start.x].attr.attr & ATTR_PROTECTED)
               )
       {
-        line->chars[start.x] = term.erase_char;
+        line->chars[start.x] = 
+          term.erase_to_screen ? basic_erase_char : term.erase_char;
         if (!start.x)
           clear_cc(line, -1);
       }
-      if (inclpos(start, cols) && start.y < term.rows)
+      if (inclpos(start, cols) && start.y < bot_y)
         line = term.lines[start.y];
     }
   }
@@ -1599,8 +2315,8 @@ struct emoji_base {
   void * buf;  // cached image
   int buflen;  // cached image
   struct {
-    uint tags: 11;
     xchar ch: 21;
+    uint tags: 11;
   } __attribute__((packed));
 };
 
@@ -1641,8 +2357,10 @@ emoji_tags(int i)
 
 #ifdef echar16
 // emoji component encoding to wchar to save half the table size
+//	E0XXX	6XXX
+//	1FXXX	5XXX
 #define echar wchar
-#define ee(x) x >= 0xE0000 ? (wchar)((x & 0xFFF) + 0x6000): x >= 0x1F000 ? (wchar)((x & 0xFFF) + 0x5000) : x
+#define ee(x) x >= 0xE0000 ? (wchar)((x & 0xFFF) + 0x6000) : x >= 0x1F000 ? (wchar)((x & 0xFFF) + 0x5000) : x
 #define ed(x) ((x >> 12) == 6 ? (xchar)x + (0xE0000 - 0x6000) : (x >> 12) == 5 ? (xchar)x + (0x1F000 - 0x5000) : x)
 #else
 #define echar xchar
@@ -1663,10 +2381,23 @@ struct emoji_seq emoji_seqs[] = {
 #include "emojiseqs.t"
 };
 
+struct emoji_dyn {
+  wchar * efn;   // image filename
+  void * buf;    // cached image
+  int buflen;    // cached image
+  uint len;      // code points
+  echar * chs;   // code points
+};
+
+struct emoji_dyn * emoji_dyns = 0;
+static uint nemoji_dyns = 0;
+
 struct emoji {
   int len: 7;   // emoji width in character cells (== # termchar positions)
-  bool seq: 1;  // true: from emoji_seq, false: from emoji_base
-  int idx: 24;  // index in either emoji_seq or emoji_base
+  uint seq: 2;  // true: from emoji_seq, false: from emoji_base
+                // 2: regional indicators 1F1E6.. 1F1FF
+                // 3: tag sequence 1F3F4 E00XX ... E007F
+  int idx: 23;  // index in either of emoji_bases, emoji_seqs, emoji_dyns
 } __attribute__((packed));
 
 #define dont_debug_emojis 1
@@ -1696,6 +2427,20 @@ clear_emoji_data()
       emoji_seqs[i].buflen = 0;
     }
   }
+  // don't clear emoji_dyns, assuming they only reside in the 'common' style
+#if 0
+  for (uint i = 0; i < nemoji_dyns; i++) {
+    if (emoji_dyns[i].efn)
+      free(emoji_dyns[i].efn);
+    if (emoji_dyns[i].buf)
+      free(emoji_dyns[i].buf);
+    if (emoji_dyns[i].chs)
+      free(emoji_dyns[i].chs);
+  }
+  nemoji_dyns = 0;
+  free(emoji_dyns);
+  emoji_dyns = 0;
+#endif
 }
 
 /*
@@ -1707,7 +2452,33 @@ get_emoji_description(termchar * cpoi)
   //struct emoji e = (struct emoji) cpoi->attr.truefg;
   struct emoji * ee = (void *)&cpoi->attr.truefg;
 
-  if (ee->seq) {
+  if (ee->seq > 1) {
+    char * en = strdup("");
+    for (uint i = 0; i < emoji_dyns[ee->idx].len; i++) {
+      xchar xc = ed(emoji_dyns[ee->idx].chs[i]);
+      char ec[8];
+      sprintf(ec, "U+%04X", xc);
+      strappend(en, ec);
+      strappend(en, " ");
+    }
+    char let[2] = " ";
+    if (ee->seq == 2) {
+      strappend(en, "| Emoji flag ");
+      for (int i = 0; i < 2; i++) {
+        *let = ed(emoji_dyns[ee->idx].chs[i]) - 0x1F1E6 + 'A';
+        strappend(en, let);
+      }
+    }
+    else {
+      strappend(en, "| Emoji tag sequence ");
+      for (uint i = 1; i < emoji_dyns[ee->idx].len - 1; i++) {
+        *let = ed(emoji_dyns[ee->idx].chs[i]) & 0xFF;
+        strappend(en, let);
+      }
+    }
+    return en;
+  }
+  else if (ee->seq == 1) {
     char * en = strdup("");
     for (uint i = 0; i < lengthof(emoji_seqs->chs) && ed(emoji_seqs[ee->idx].chs[i]); i++) {
       xchar xc = ed(emoji_seqs[ee->idx].chs[i]);
@@ -1731,7 +2502,10 @@ static bool
 check_emoji(struct emoji e)
 {
   wchar * * efnpoi;
-  if (e.seq) {
+  if (e.seq > 1) {
+    efnpoi = (wchar * *)&emoji_dyns[e.idx].efn;
+  }
+  else if (e.seq == 1) {
     efnpoi = (wchar * *)&emoji_seqs[e.idx].efn;
   }
   else {
@@ -1802,7 +2576,18 @@ fallback:;
   }
   char * en = strdup(pre);
   char ec[7];
-  if (e.seq) {
+  if (e.seq > 1) {
+    for (uint i = 0; i < emoji_dyns[e.idx].len; i++) {
+      xchar xc = ed(emoji_dyns[e.idx].chs[i]);
+      if ((xc != 0xFE0F || sel) && (xc != 0x200D || zwj)) {
+        if (i)
+          strappend(en, sep);
+        sprintf(ec, fmt, xc);
+        strappend(en, ec);
+      }
+    }
+  }
+  else if (e.seq == 1) {
     for (uint i = 0; i < lengthof(emoji_seqs->chs) && ed(emoji_seqs[e.idx].chs[i]); i++) {
       xchar xc = ed(emoji_seqs[e.idx].chs[i]);
       if ((xc != 0xFE0F || sel) && (xc != 0x200D || zwj)) {
@@ -1821,8 +2606,8 @@ fallback:;
   wchar * wen = cs__utftowcs(en);
 
   char * ef = get_resource_file(W("emojis"), wen, false);
-#ifdef debug_emojis
-  printf("emoji <%s> file <%s>\n", en, ef);
+#if defined(debug_emojis) && debug_emojis > 1
+  printf("check_emoji seq %d idx %d (style %d) <%s> file <%s>\n", e.seq, e.idx, style, en, ef);
 #endif
   free(wen);
   free(en);
@@ -1835,7 +2620,7 @@ fallback:;
   else {
     // if no emoji graphics found, fallback to "common" emojis
     if (style) {
-      style = 0;
+      style = EMOJIS_NONE;
       goto fallback;
     }
 
@@ -1844,14 +2629,27 @@ fallback:;
   }
 }
 
+static xchar
+xchr(termchar * d)
+{
+  xchar xch = d->chr;
+  if ((xch & 0xFC00) == 0xD800 && d->cc_next) {
+    termchar * cc = d + d->cc_next;
+    if ((cc->chr & 0xFC00) == 0xDC00) {
+      xch = ((xchar) (xch - 0xD7C0) << 10) | (cc->chr & 0x03FF);
+    }
+  }
+  return xch;
+}
+
 static int
-match_emoji_seq(termchar * d, int maxlen, echar * chs)
+match_emoji_seq(termchar * d, int maxlen, echar * chs, uint len)
 {
   int l_text = 0; // number of matched text base character positions
   termchar * basechar = d;
   termchar * curchar = d;
 
-  for (uint i = 0; i < lengthof(emoji_seqs->chs) && ed(chs[i]); i++) {
+  for (uint i = 0; i < len && ed(chs[i]); i++) {
     if (!curchar)
       return 0;
     if (curchar == basechar)
@@ -1915,7 +2713,7 @@ match_emoji(termchar * d, int maxlen)
   uint tags = emoji_tags(tagi);
   if (tags) {
 #if defined(debug_emojis) && debug_emojis > 2
-    printf("%04X%s%s%s%s%s\n", ch,
+    printf("match base %04X%s%s%s%s%s\n", xchr(d),
            tags & EM_pres ? " pres" : "",
            tags & EM_pict ? " pict" : "",
            tags & EM_text ? " text" : "",
@@ -1944,10 +2742,10 @@ match_emoji(termchar * d, int maxlen)
     bool foundseq = false;
     if (tags & EM_base) {
       for (uint i = 0; i < lengthof(emoji_seqs); i++) {
-        int len = match_emoji_seq(d, maxlen, emoji_seqs[i].chs);
+        int len = match_emoji_seq(d, maxlen, emoji_seqs[i].chs, lengthof(emoji_seqs->chs));
         if (len) {
 #if defined(debug_emojis) && debug_emojis > 1
-          printf("match");
+          printf("match seqs");
           for (uint k = 0; k < lengthof(emoji_seqs->chs) && ed(emoji_seqs[i].chs[k]); k++)
             printf(" %04X", ed(emoji_seqs[i].chs[k]));
           printf("\n");
@@ -1974,7 +2772,108 @@ match_emoji(termchar * d, int maxlen)
           }
         }
       }
+
+      if (!emoji.len && !foundseq) {
+        // try to locate in dynamic emoji list
+        for (uint i = 0; i < nemoji_dyns; i++) {
+          int len = match_emoji_seq(d, maxlen, emoji_dyns[i].chs, emoji_dyns[i].len);
+          if (len) {
+#if defined(debug_emojis) && debug_emojis > 1
+            printf("match dyns");
+            for (uint k = 0; k < emoji_dyns[i].len; k++)
+              printf(" %04X", ed(emoji_dyns[i].chs[k]));
+            printf("\n");
+#endif
+            emoji.seq = ed(emoji_dyns[i].chs[0]) == 0x1F3F4 ? 3 : 2;
+            emoji.idx = i;
+            emoji.len = len;
+            if (check_emoji(emoji))
+              break;
+            else {
+              // found a match but there is no emoji graphics for it
+              // remember longest match in case we don't find another
+              if (!foundseq) {
+                longest = emoji;
+                foundseq = true;
+              }
+              // invalidate this match, continue matching
+              emoji.len = 0;
+            }
+          }
+        }
+      }
+      if (!emoji.len && maxlen > 1) {
+        // check whether to add to dynamic emoji list
+        echar * chs = newn(echar, 2);
+        xchar xch = xchr(d);
+        if (xch >= 0x1F1E6 && xch <= 0x1F1FF) {
+          chs[0] = ee(xch);
+          xch = xchr(&d[1]);
+          chs[1] = ee(xch);
+          if (xch >= 0x1F1E6 && xch <= 0x1F1FF) {
+            // two regional indicators
+            emoji.seq = 2;
+            emoji.len = 2;
+          }
+        }
+        else if (xch == 0x1F3F4) {  // check for tag sequence ..E00XX..E007F
+          chs[0] = ee(xch);
+          termchar * curlowsurr = d + d->cc_next;  // low surrogate of U+1F3F4
+
+          int l = 1;
+          while (curlowsurr->cc_next) {
+            curlowsurr += curlowsurr->cc_next;
+            xch = xchr(curlowsurr);
+            l ++;
+            chs = renewn(chs, l);
+            chs[l - 1] = ee(xch);
+
+            if (xch == 0xE007F) {
+              emoji.seq = 3;
+              emoji.len = l;
+              break;
+            }
+            // check for valid Flag Emoji Tag Sequences (Unicode TR #51 C.1)
+            // (http://www.unicode.org/reports/tr51/#flag-emoji-tag-sequences)
+            if (xch > 0xE007F || xch < 0xE0020)
+              break;
+
+            curlowsurr += curlowsurr->cc_next;  // low surrogate of current char
+          }
+        }
+        if (emoji.len) {  // add sequence to dynamic list
+          emoji_dyns = renewn(emoji_dyns, nemoji_dyns + 1);
+
+          emoji_dyns[nemoji_dyns].efn = 0;
+          emoji_dyns[nemoji_dyns].buf = 0;
+          emoji_dyns[nemoji_dyns].buflen = 0;
+          emoji_dyns[nemoji_dyns].len = emoji.len;
+          emoji_dyns[nemoji_dyns].chs = chs;
+
+          emoji.idx = nemoji_dyns;
+
+          bool ok = check_emoji(emoji);
+          if (ok) {
+#if defined(debug_emojis) && debug_emojis > 0
+            printf("emoji_dyn [%d++] seq %d len %d", nemoji_dyns, emoji.seq, emoji.len);
+            for (int i = 0; i < emoji.len; i++)
+              printf(" %04X", ed(chs[i]));
+            printf("\n");
+#endif
+            nemoji_dyns ++;
+          }
+          else {
+            // invalidate this entry
+            if (emoji_dyns[nemoji_dyns].efn)
+              free(emoji_dyns[nemoji_dyns].efn);
+            if (emoji_dyns[nemoji_dyns].chs)
+              free(emoji_dyns[nemoji_dyns].chs);
+            emoji.len = 0;
+          }
+        }
+      }
     }
+
     if (!emoji.len) {
       wchar combchr = 0;
       if (comb) {
@@ -2027,12 +2926,21 @@ match_emoji(termchar * d, int maxlen)
       else
         emoji.len = 0;  // display text style
     }
+
     if (!emoji.len) {
       // not found another match; if we had a "longest match" before, 
       // but continued to search because it had no graphics, let's use it
       if (foundseq)
-        return longest;
+        emoji = longest;
     }
+
+#if defined(debug_emojis) && debug_emojis > 1
+    if (emoji.len) {
+      int i = emoji.idx;
+      struct emoji_base * ee = emoji.seq > 1 ? (struct emoji_base *)&emoji_dyns[i] : emoji.seq ? (struct emoji_base *)&emoji_seqs[i] : &emoji_bases[i];
+      printf("-> seq %d len %d idx %d <%ls> %d\n", emoji.seq, emoji.len, i, ee->efn, !!ee->buf);
+    }
+#endif
   }
 
   return emoji;
@@ -2044,7 +2952,12 @@ emoji_show(int x, int y, struct emoji e, int elen, cattr eattr, ushort lattr)
   wchar * efn;
   void * * bufpoi;
   int * buflen;
-  if (e.seq) {
+  if (e.seq > 1) {
+    efn = emoji_dyns[e.idx].efn;
+    bufpoi = &emoji_dyns[e.idx].buf;
+    buflen = &emoji_dyns[e.idx].buflen;
+  }
+  else if (e.seq == 1) {
     efn = emoji_seqs[e.idx].efn;
     bufpoi = &emoji_seqs[e.idx].buf;
     buflen = &emoji_seqs[e.idx].buflen;
@@ -2054,7 +2967,7 @@ emoji_show(int x, int y, struct emoji e, int elen, cattr eattr, ushort lattr)
     bufpoi = &emoji_bases[e.idx].buf;
     buflen = &emoji_bases[e.idx].buflen;
   }
-#ifdef debug_emojis
+#if defined(debug_emojis) && debug_emojis > 1
   printf("emoji_show @%d:%d..%d it %d seq %d idx %d <%ls>\n", y, x, elen, !!(eattr.attr & ATTR_ITALIC), e.seq, e.idx, efn);
 #endif
 
@@ -2071,7 +2984,7 @@ emoji_show(int x, int y, struct emoji e, int elen, cattr eattr, ushort lattr)
 #ifdef debug_win_text_invocation
 
 void
-_win_text(int line, int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, ushort lattr, bool has_rtl, bool clearpad, uchar phase)
+_win_text(int line, int tx, int ty, wchar *text, int len, cattr attr, cattr *textattr, ushort lattr, char has_rtl, bool clearpad, uchar phase)
 {
   if (*text != ' ') {
     printf("[%d] %d:%d(len %d) attr %08llX", line, ty, tx, len, attr.attr);
@@ -2132,7 +3045,11 @@ term_paint(void)
     term.cursor_on && !term.show_other_screen
     ? term.curs.y - term.disptop : -1;
 
-  for (int i = 0; i < term.rows; i++) {
+  int nlines_progress = 0;
+  int total_progress = 0;
+
+  // Paint all lines, including status area
+  for (int i = 0; i < term_allrows; i++) {
     pos scrpos;
     scrpos.y = i + term.disptop;
     termline *line = fetch_line(scrpos.y);
@@ -2198,8 +3115,8 @@ term_paint(void)
                )
               equalattrs = false;
           }
-#ifdef debug_emojis
-          printf("matched len %d seq %d idx %d ok %d atr %d\n", e.len, e.seq, e.idx, ok, equalattrs);
+#if defined(debug_emojis) && debug_emojis > 3
+          printf("paint emoji: matched len %d seq %d idx %d ok %d atr %d\n", e.len, e.seq, e.idx, ok, equalattrs);
 #endif
 
           // modify character data to trigger later emoji display
@@ -2447,8 +3364,8 @@ term_paint(void)
                )
               equalattrs = false;
           }
-#ifdef debug_emojis
-          printf("matched len %d seq %d idx %d ok %d atr %d\n", e.len, e.seq, e.idx, ok, equalattrs);
+#if defined(debug_emojis) && debug_emojis > 3
+          printf("paint emoji: matched len %d seq %d idx %d ok %d atr %d\n", e.len, e.seq, e.idx, ok, equalattrs);
 #endif
 
           // modify character data to trigger later emoji display
@@ -2511,6 +3428,7 @@ term_paint(void)
       */
       if (tchar >= 0x2320 &&
           ((tchar >= 0x2500 && tchar <= 0x259F)
+           || (tchar >= 0x25E2 && tchar <= 0x25E5)
            || (tchar >= 0x239B && tchar <= 0x23B3)
            || (tchar >= 0x23B7 && tchar <= 0x23BD)
            || wcschr(W("〳〴〵⌠⌡⏐"), tchar)
@@ -2554,6 +3472,14 @@ term_paint(void)
           termchar * cc = d + d->cc_next;
           if ((cc->chr & 0xFC00) == 0xDC00) {
             xch = ((xchar) (xch - 0xD7C0) << 10) | (cc->chr & 0x03FF);
+          }
+
+          if ((xch >= 0x1F67C && xch <= 0x1F67F)
+              || (xch >= 0x1FB00 && xch <= 0x1FBB3)
+             )
+          {
+            tattr.attr |= TATTR_ZOOMFULL;
+            tattr.attr &= ~ATTR_ITALIC;
           }
         }
 
@@ -2706,6 +3632,24 @@ term_paint(void)
       newchars[j].chr = tchar;
      /* Combining characters are still read from chars */
       newchars[j].cc_next = 0;
+
+     /* Margin indication */
+      if (term.dim_margins &&
+          (// in normal display:
+           i < term.marg_top || (i > term.marg_bot && i < term.rows)
+           // in status display:
+           || (i >= term.rows && i < term.marg_top + term.rows)
+           || (i > term.marg_bot + term.rows)
+           // outside left/right margins:
+           || j < term.marg_left || j > term.marg_right
+          )
+         )
+      {
+        cattr * ca = &newchars[j].attr;
+        ca->attr |= ATTR_DIM;
+        ca->attr ^= ATTR_REVERSE;
+      }
+
     }  // end first loop
 
     if (i == curs_y) {
@@ -2743,8 +3687,48 @@ term_paint(void)
 #endif
         dispchars[curs_x].attr.attr |= ATTR_INVALID;
 
-     /* Progress indication */
-      if (term.detect_progress) {
+     /* Numeric input feedback */
+      uint what;
+      wchar * ifs = char_code_indication(&what);
+      if (ifs) {
+        curs_x = max(min(curs_x, (int)term.cols - (int)wcslen(ifs)), 0);
+        while (*ifs) {
+          newchars[curs_x].chr = *ifs++;
+          newchars[curs_x].attr.attr &= ~(TATTR_WIDE | TATTR_EXPAND);
+          newchars[curs_x].attr = CATTR_DEFAULT;
+          if (what >= 4) {
+            newchars[curs_x].attr.attr |= ATTR_ULCOLOUR | ATTR_BOLD;
+            newchars[curs_x].attr.ulcolr = RGB(255, 0, 0);
+          }
+          else {
+            newchars[curs_x].attr.attr |= ATTR_REVERSE | ATTR_DIM;
+            newchars[curs_x].attr.attr |= ATTR_ULCOLOUR | ATTR_BOLD;
+            newchars[curs_x].attr.ulcolr = RGB(255, 0, 0);
+          }
+          switch (what) {
+            when 16:
+              newchars[curs_x].attr.attr |= ATTR_DOUBLYUND;
+            when 10:
+              newchars[curs_x].attr.attr |= ATTR_CURLYUND;
+            when 8:
+              newchars[curs_x].attr.attr |= ATTR_BROKENUND;
+            when 4:  // ALT_ALONE
+              newchars[curs_x].attr.attr |= ATTR_BLINK2;
+            when 2:  // COMP_ACTIVE
+              newchars[curs_x].attr.attr |= ATTR_OVERL;
+            when 1:
+              newchars[curs_x].attr.attr |= ATTR_OVERL | ATTR_BLINK2;
+          }
+          dispchars[curs_x].attr.attr |= ATTR_INVALID;
+          curs_x++;
+        }
+        term.st_kb_flag = what;
+      }
+      else
+        term.st_kb_flag = 0;
+
+     /* Progress indication on current cursor line (after back positioning) */
+      if (term.detect_progress && term.progress_scan == 1) {
         int j = term.cols;
         while (--j > 0) {
           if (chars[j].chr == '%'
@@ -2783,6 +3767,39 @@ term_paint(void)
         if (p <= 100) {
           taskbar_progress(- term.detect_progress);
           taskbar_progress(p);
+        }
+      }
+    }
+
+   /* Progress indication accumulated on all lines */
+    if (term.detect_progress && term.progress_scan == 2) {
+      int j = term.cols;
+      while (--j > 0) {
+        if (chars[j].chr == '%') {
+          int p = 0;
+          int f = 1;
+          bool pro = false;
+          while (--j >= 0) {
+            if (chars[j].chr >= '0' && chars[j].chr <= '9') {
+              p += f * (chars[j].chr - '0');
+              f *= 10;
+              pro = true;
+            }
+            else if (chars[j].chr == '.' || chars[j].chr == ',') {
+              p = 0;
+              f = 1;
+            }
+            else {
+              j++;
+              break;
+            }
+          }
+
+          if (pro && p <= 100) {
+            nlines_progress ++;
+            total_progress += p;
+          }
+          break;
         }
       }
     }
@@ -2911,7 +3928,7 @@ term_paint(void)
     cattr textattr[maxtextlen];
     int textlen = 0;
 
-    bool has_rtl = false;
+    char has_rtl = 0;
     uchar bc = 0;
     bool dirty_run = (line->lattr != displine->lattr);
     bool dirty_line = dirty_run;
@@ -2933,7 +3950,7 @@ term_paint(void)
     int ovl_x, ovl_y;
     cattr ovl_attr;
     ushort ovl_lattr;
-    bool ovl_has_rtl;
+    char ovl_has_rtl;
 
     void flush_text()
     {
@@ -2951,7 +3968,7 @@ term_paint(void)
 # define debug_out_text
 #endif
 
-    void out_text(int x, int y, wchar *text, int len, cattr attr, cattr *textattr, ushort lattr, bool has_rtl)
+    void out_text(int x, int y, wchar *text, int len, cattr attr, cattr *textattr, ushort lattr, char has_rtl)
     {
 #ifdef debug_out_text
       wchar t[len + 1]; wcsncpy(t, text, len); t[len] = 0;
@@ -3000,7 +4017,7 @@ term_paint(void)
             win_text(x, y, esp, elen, eattr, textattr, lattr, has_rtl, false, 1);
             flush_text();
           }
-#if defined(debug_emojis) && debug_emojis > 3
+#if defined(debug_emojis) && debug_emojis > 4
           // add background to some emojis
           eattr.attr &= ~(ATTR_BGMASK | ATTR_FGMASK);
           eattr.attr |= 6 << ATTR_BGSHIFT | 4;
@@ -3015,7 +4032,7 @@ term_paint(void)
             emoji_show(x, y, *ee, elen, eattr, lattr);
           }
         }
-#if defined(debug_emojis) && debug_emojis > 3
+#if defined(debug_emojis) && debug_emojis > 4
         else { // mark some emojis
           eattr.attr &= ~(ATTR_BGMASK | ATTR_FGMASK);
           eattr.attr |= 4 << ATTR_BGSHIFT | 6;
@@ -3036,7 +4053,16 @@ term_paint(void)
       else if (overlaying) {
         return;
       }
-      else if (attr.attr & (ATTR_ITALIC | TATTR_COMBDOUBL | TATTR_OVERHANG)) {
+      else if (attr.attr
+          & (ATTR_ITALIC | TATTR_COMBDOUBL | TATTR_OVERHANG | TATTR_MARKCURS)
+        )
+      {
+        /* Split output into 2 phases, for background and foreground, 
+           to support overlay display in some cases:
+           * italics and other potential overhang situations (emojis)
+           * combining doubles
+           * cursor position, to support underlay cursor painting
+         */
         win_text(x, y, text, len, attr, textattr, lattr, has_rtl, false, 1);
         flush_text();
         ovl_x = x;
@@ -3161,8 +4187,11 @@ term_paint(void)
       uchar tbc = bidi_class(xtchar);
 
       if (textlen && tbc != bc) {
-        if (!is_sep_class(tbc) && !is_sep_class(bc))
-          // break at RTL and other changes to avoid glyph confusion (#285)
+        if (is_rtl_class(tbc) != is_rtl_class(bc))
+          // break at RTL to support RTL font fallback
+          trace_run("rtl"), break_run = true;
+        else if (!is_sep_class(tbc) && !is_sep_class(bc))
+          // break at other changes to avoid glyph confusion (#285)
           trace_run("bcs"), break_run = true;
         //else if (is_punct_class(tbc) || is_punct_class(bc))
         else if ((tbc == EN) ^ (bc == EN))
@@ -3171,12 +4200,13 @@ term_paint(void)
       }
       bc = tbc;
 
+     /* Flush previous output chunk on break_run */
       if (break_run || cfg.bloom) {
         if ((dirty_run && textlen) || overlaying)
           out_text(start, i, text, textlen, attr, textattr, line->lattr, has_rtl);
         start = j;
         textlen = 0;
-        has_rtl = false;
+        has_rtl = 0;
         attr = tattr;
         dirty_run = dirty_line;
 #if defined(debug_dirty) && debug_dirty > 1
@@ -3209,8 +4239,14 @@ term_paint(void)
       ///textattr[textlen] = tattr;
       textlen++;
 
-      if (!has_rtl)
-        has_rtl = is_rtl_class(tbc);
+      if (is_rtl_class(tbc)) {
+        if (tbc == R)
+          has_rtl |= 1;
+        else if (tbc == AL)
+          has_rtl |= 2;
+        else
+          has_rtl |= 4;
+      }
 
 #define dont_debug_surrogates
 
@@ -3329,6 +4365,10 @@ term_paint(void)
     * Release the line data fetched from the screen or scrollback buffer.
     */
     release_line(line);
+  }
+  if (term.detect_progress && term.progress_scan == 2) {
+    taskbar_progress(- term.detect_progress);
+    taskbar_progress(nlines_progress ? total_progress / nlines_progress : 0);
   }
 
   term.cursor_invalid = false;

@@ -67,7 +67,9 @@ extern bool title_settable;
 extern bool support_wsl;
 extern wchar * wslname;
 extern wstring wsl_basepath;
+extern bool report_config;
 extern bool report_child_pid;
+extern bool report_child_tty;
 
 extern int ini_width, ini_height;
 extern bool win_is_fullscreen;
@@ -76,6 +78,7 @@ extern bool clipboard_token;
 extern uint dpi;
 extern int per_monitor_dpi_aware;
 extern bool keep_screen_on;
+extern bool force_opaque;
 
 extern bool click_focus_token;
 extern pos last_pos;
@@ -89,7 +92,7 @@ extern bool fill_background(HDC dc, RECT * boxp);
 extern void win_flush_background(bool clearbg);
 extern void win_paint(void);
 
-extern void win_init_fonts(int size);
+extern void win_init_fonts(int size, bool allfonts);
 extern wstring win_get_font(uint findex);
 extern void win_change_font(uint findex, wstring fn);
 extern void win_font_cs_reconfig(bool font_changed);
@@ -148,6 +151,8 @@ extern wstring wslicon(wchar * params);
 
 extern char * foreground_cwd(void);
 
+extern void toggle_status_line(void);
+
 extern void win_switch(bool back, bool alternate);
 extern int sync_level(void);
 
@@ -167,6 +172,6 @@ extern void win_toggle_on_top(void);
 
 extern unsigned long mtime(void);
 
-extern void term_save_image(void);
+extern void term_save_image(bool do_open);
 
 #endif

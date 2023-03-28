@@ -23,6 +23,7 @@ enum { EMPL_STRETCH = 0, EMPL_ALIGN = 1, EMPL_MIDDLE = 2, EMPL_FULL = 3 };
 // Colour values.
 
 typedef uint colour;
+typedef struct { colour fg, bg; } colour_pair;
 
 enum { DEFAULT_COLOUR = UINT_MAX };
 
@@ -71,7 +72,7 @@ typedef struct {
   bool cursor_blinks;
   // Text
   font_spec font;
-  font_spec fontfams[11];
+  font_spec fontfams[12];
   wstring font_choice;
   wstring font_sample;
   bool show_hidden_fonts;
@@ -114,11 +115,14 @@ typedef struct {
   string key_scrlock;	// VK_SCROLL
   wstring key_commands;
   int manage_leds;
+  bool enable_remap_ctrls;
+  bool old_keyfuncs_keypad;
   // Mouse
   bool clicks_place_cursor;
   char middle_click_action;
   char right_click_action;
   int opening_clicks;
+  char opening_mod;
   bool zoom_mouse;
   char clicks_target_app;
   char click_target_mod;
@@ -140,7 +144,9 @@ typedef struct {
   int selection_show_size;
   // Window
   int cols, rows;
+  bool rewrap_on_resize;
   int scrollback_lines;
+  int max_scrollback_lines;
   char scrollbar;
   char scroll_mod;
   bool pgupdn_scroll;
@@ -150,6 +156,7 @@ typedef struct {
   // Terminal
   string term;
   wstring answerback;
+  int wrap_tab;
   bool old_wrapmodes;
   bool enable_deccolm_init;
   int bell_type;
@@ -161,6 +168,7 @@ typedef struct {
   bool bell_taskbar; // xterm: bellIsUrgent
   bool bell_popup;   // xterm: popOnBell
   int bell_interval;
+  int play_tone;
   wstring printer;
   bool confirm_exit;
   // Command line
@@ -218,6 +226,7 @@ typedef struct {
   string menu_title_ctrl_r;
   int geom_sync;
   int tabbar;
+  int new_tabs;
   int col_spacing, row_spacing;
   int auto_leading;
   int padding;
@@ -228,17 +237,20 @@ typedef struct {
   string word_chars;
   string word_chars_excl;
   colour ime_cursor_colour;
-  colour ansi_colours[16];
+  colour_pair ansi_colours[16];
   wstring sixel_clip_char;
   bool short_long_opts;
   bool bold_as_special;
   bool hover_title;
   char progress_bar;
+  int progress_scan;
   int baud;
   int bloom;
   wstring options_font;
   int options_fontsize;
   string old_options;
+  bool dim_margins;
+  bool status_line;
   bool old_xbuttons;
   // Legacy
   bool use_system_colours;
